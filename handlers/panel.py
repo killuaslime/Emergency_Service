@@ -1,4 +1,4 @@
-
+import asyncio
 import logging
 from datetime import datetime
 
@@ -13,6 +13,9 @@ from database.database import (
     get_latest_outage,
     save_panel,
     switch_power,
+    get_pending_group_notifications,
+    mark_outage_notification_sent,
+    mark_restoration_notification_sent,
 )
 
 router = Router()
@@ -204,17 +207,7 @@ async def power_callback(event: MessageCallback):
 
         print("EDIT RESULT:", repr(edited))
         # Отправляем оповещение в рабочую группу
-        try:
-            await send_group_notification(
-                bot=event.bot,
-                action=action,
-                user=db_user,
-                outage=outage,
-                result=result
-            )
-            print("GROUP NOTIFICATION: отправлено")
-        except Exception:
-            logging.exception("Не удалось отправить сообщение в группу")
+
 
         if result["status"] == "off":
             notification = "Отключение зарегистрировано."
@@ -242,36 +235,6 @@ async def power_callback(event: MessageCallback):
         except Exception:
             pass
 
-
-
-async def send_group_notification(bot, action, user, outage, result):
-    if action == "power_off" and result["status"] == "off":
-        emoji = "🔴"
-        time_text = (
-            f"Отключение ЭЭ с {format_time(outage['started_at'])}"
-        )
-
-    elif action == "power_on" and result["status"] == "on":
-        emoji = "🟢"
-        time_text = (
-            f"Отключение ЭЭ с {format_time(outage['started_at'])} "
-            f"до {format_time(outage['ended_at'])}"
-        )
-
-    else:
-        return
-
-    text = (
-        f"{emoji}№{user['code']}\n"
-        f"{user['address'].strip()}\n"
-        f"{time_text}"
-    )
-
-    await bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=text
-    )
-
 async def refresh_shop_panel(bot, db_user):
     """Обновляет существующую главную панель магазина."""
 
@@ -294,3 +257,83 @@ async def refresh_shop_panel(bot, db_user):
     )
 
     return outage
+
+async def group_notification_scheduler(bot):
+    """Отправляет уведомления об отключениях с задержкой 60 секунд."""
+
+    while True:
+        try:
+            pending = await get_pending_group_notifications()
+
+            for outage in pending:
+                try:
+                    notification_sent = (
+                        outage["notification_sent_at"] is not None
+                    )
+
+                    # Сначала отправляем сообщение об отключении
+                    if not notification_sent:
+                        off_text = (
+                            f"🔴№{outage['code']}\n"
+                            f"{outage['address'].strip()}\n"
+                            f"Отключение ЭЭ с "
+                            f"{format_time(outage['started_at'])}"
+                        )
+
+                        await bot.send_message(
+                            chat_id=GROUP_CHAT_ID,
+                            text=off_text
+                        )
+
+                        await mark_outage_notification_sent(
+                            outage["outage_id"]
+                        )
+
+                        notification_sent = True
+
+                        logging.info(
+                            "Отправлено уведомление об отключении: %s",
+                            outage["code"]
+                        )
+
+                    # Если электричество уже восстановлено,
+                    # отправляем сообщение о восстановлении
+                    if (
+                        outage["ended_at"] is not None
+                        and notification_sent
+                        and outage["restoration_sent_at"] is None
+                    ):
+                        on_text = (
+                            f"🟢№{outage['code']}\n"
+                            f"{outage['address'].strip()}\n"
+                            f"Отключение ЭЭ с "
+                            f"{format_time(outage['started_at'])} "
+                            f"до {format_time(outage['ended_at'])}"
+                        )
+
+                        await bot.send_message(
+                            chat_id=GROUP_CHAT_ID,
+                            text=on_text
+                        )
+
+                        await mark_restoration_notification_sent(
+                            outage["outage_id"]
+                        )
+
+                        logging.info(
+                            "Отправлено уведомление о восстановлении: %s",
+                            outage["code"]
+                        )
+
+                except Exception:
+                    logging.exception(
+                        "Ошибка отправки уведомления для отключения %s",
+                        outage["outage_id"]
+                    )
+
+        except Exception:
+            logging.exception(
+                "Ошибка фонового планировщика уведомлений"
+            )
+
+        await asyncio.sleep(1)

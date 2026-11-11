@@ -1,6 +1,7 @@
 
 import logging
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from maxapi import Router, F
 from maxapi.types import MessageCallback, CallbackButton
@@ -9,11 +10,15 @@ from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from database.database import (
     get_supervisor_shops,
     get_supervisor_history,
+    get_supervisor_daily_check_results,
+    save_supervisor_daily_report,
+    get_supervisor_daily_report,
+    clear_supervisor_daily_report,
 )
 from services.supervisors import get_supervisor_by_id
 
 router = Router()
-
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 def format_datetime(value):
     if not value:
@@ -45,7 +50,47 @@ def calculate_duration(start, end=None):
 
     parts.append(f"{minutes} мин.")
     return " ".join(parts)
+async def get_daily_stats_text(supervisor_id: int, check_date: str):
+    results = await get_supervisor_daily_check_results(
+        supervisor_id,
+        check_date
+    )
 
+    if not results:
+        return (
+            "🌅 УТРЕННЯЯ СТАТИСТИКА\n\n"
+            "Опросы на сегодня ещё не созданы."
+        )
+
+    online = sum(1 for shop in results if shop["status"] == "on")
+    offline = sum(1 for shop in results if shop["status"] == "off")
+    unanswered = sum(1 for shop in results if shop["status"] is None)
+
+    lines = [
+        "🌅 УТРЕННЯЯ СТАТИСТИКА",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🟢 Открытые магазины со светом: {online}",
+        f"🔴 Открытые магазины без света: {offline}",
+        f"⚪ Не ответили на опрос: {unanswered}",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for shop in results:
+        if shop["status"] == "off":
+            lines.append(
+                f"❌ №{shop['code']}\n"
+                f"{shop['address']}\n"
+                f"Открылся без ЭЭ в 08:15"
+            )
+
+        elif shop["status"] is None:
+            lines.append(
+                f"⚪ №{shop['code']}\n"
+                f"{shop['address']}\n"
+                f"Ожидается ответ"
+            )
+
+    return "\n\n".join(lines)
 
 def create_keyboard(view="menu"):
     builder = InlineKeyboardBuilder()
@@ -56,6 +101,12 @@ def create_keyboard(view="menu"):
         )
         builder.row(
             CallbackButton(text="📊 Текущая ситуация", payload="sv:status")
+        )
+        builder.row(
+            CallbackButton(
+                text="🌅 Утренняя статистика",
+                payload="sv:daily_stats"
+            )
         )
         builder.row(
             CallbackButton(text="🔴/🟢 Детали отключения", payload="sv:details")
@@ -79,6 +130,12 @@ async def get_view_text(supervisor_id, view):
             "Выберите нужный раздел:"
         )
 
+    if view == "daily_stats":
+        check_date = datetime.now(MOSCOW_TZ).date().isoformat()
+        return await get_daily_stats_text(
+            supervisor_id,
+            check_date
+        )
 
 
     if view == "shops":
@@ -87,10 +144,17 @@ async def get_view_text(supervisor_id, view):
 
         total = len(shops)
 
-        registered = sum(
-            1 for shop in shops
+        registered_shops = [
+            shop for shop in shops
             if shop["is_registered"]
+        ]
+
+        offline = sum(
+            1 for shop in registered_shops
+            if shop["started_at"] is not None
         )
+
+        online = len(registered_shops) - offline
 
         pending = sum(
             1 for shop in shops
@@ -98,45 +162,51 @@ async def get_view_text(supervisor_id, view):
             and shop["has_pending_request"]
         )
 
-        not_registered = total - registered - pending
+        not_registered = total - len(registered_shops) - pending
 
-        lines = ["🏪 ВАШИ МАГАЗИНЫ\n"]
+        lines = ["🏪 МОИ МАГАЗИНЫ\n"]
 
         for shop in shops:
             if shop["is_registered"]:
-                registration_status = "🟢 Зарегистрирован"
+                if shop["started_at"] is not None:
+                    started_time = datetime.fromisoformat(
+                        shop["started_at"]
+                    ).strftime("%H:%M")
 
-                power_status = (
-                    "🔴 Нет электричества"
-                    if shop["started_at"] is not None
-                    else "🟢 Работает"
-                )
+                    lines.append(
+                        f"🔴 {shop['code']}\n"
+                        f"{shop['address']}\n"
+                        f"ЭЭ отсутствует с {started_time}"
+                    )
+                else:
+                    lines.append(
+                        f"🟢 {shop['code']}\n"
+                        f"{shop['address']}"
+                    )
 
             elif shop["has_pending_request"]:
-                registration_status = "🟡 Ожидает подтверждения"
-                power_status = "⚪ Статус неизвестен"
+                lines.append(
+                    f"🟡 {shop['code']}\n"
+                    f"{shop['address']}\n"
+                    f"Регистрация: 🟡 Ожидает подтверждения"
+                )
 
             else:
-                registration_status = "🔴 Не зарегистрирован"
-                power_status = "⚪ Статус неизвестен"
-
-            lines.append(
-                f"Магазин: {shop['code']}\n"
-                f"Адрес: {shop['address']}\n"
-                f"Регистрация: {registration_status}\n"
-                f"Электричество: {power_status}\n"
-            )
+                lines.append(
+                    f"⚪ {shop['code']}\n"
+                    f"{shop['address']}\n"
+                    f"Регистрация: 🔴 Не зарегистрирован"
+                )
 
         lines.append(
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📊 СТАТИСТИКА РЕГИСТРАЦИИ\n\n"
-            f"Всего магазинов: {total}\n"
-            f"🟢 Зарегистрировано: {registered}\n"
-            f"🟡 Ожидают подтверждения: {pending}\n"
-            f"🔴 Не зарегистрировано: {not_registered}"
+            "------------------------------------\n"
+            "📊 ТЕКУЩАЯ СИТУАЦИЯ\n\n"
+            f"🟢 Со светом: {online}\n"
+            f"🔴 Без света: {offline}"
         )
 
-        return "\n".join(lines)
+        return "\n\n".join(lines)
+
 
 
     if view == "status":
@@ -226,6 +296,7 @@ async def show_supervisor_panel(event, supervisor):
         "sv:status",
         "sv:details",
         "sv:history",
+        "sv:daily_stats",
     ])
 )
 async def supervisor_callback(event: MessageCallback):
@@ -245,11 +316,32 @@ async def supervisor_callback(event: MessageCallback):
 
         view = event.callback.payload.split(":", 1)[1]
 
+        check_date = datetime.now(MOSCOW_TZ).date().isoformat()
+
         edited = await event.bot.edit_message(
             message_id=event.message.body.mid,
             text=await get_view_text(user.user_id, view),
             attachments=[create_keyboard(view)],
             notify=False
+        )
+
+        if edited.success:
+            if view == "daily_stats":
+                await save_supervisor_daily_report(
+                    supervisor_id=user.user_id,
+                    check_date=check_date,
+                    message_id=event.message.body.mid
+                )
+            else:
+                await clear_supervisor_daily_report(
+                    supervisor_id=user.user_id,
+                    check_date=check_date
+                )
+
+        logging.info(
+            "Панель супервайзера обновлена: view=%s success=%s",
+            view,
+            edited.success
         )
 
         logging.info(
@@ -261,4 +353,39 @@ async def supervisor_callback(event: MessageCallback):
     except Exception:
         logging.exception(
             "Ошибка панели супервайзера"
+        )
+async def refresh_supervisor_daily_report(
+    bot,
+    supervisor_id: int,
+    check_date: str
+):
+    message_id = await get_supervisor_daily_report(
+        supervisor_id,
+        check_date
+    )
+
+    if message_id is None:
+        return
+
+    try:
+        edited = await bot.edit_message(
+            message_id=message_id,
+            text=await get_daily_stats_text(
+                supervisor_id,
+                check_date
+            ),
+            attachments=[create_keyboard("daily_stats")],
+            notify=False
+        )
+
+        logging.info(
+            "Утренняя статистика супервайзера %s обновлена: %s",
+            supervisor_id,
+            edited.success
+        )
+
+    except Exception:
+        logging.exception(
+            "Не удалось обновить статистику супервайзера %s",
+            supervisor_id
         )

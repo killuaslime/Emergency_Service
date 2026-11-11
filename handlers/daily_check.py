@@ -12,6 +12,7 @@ from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from config import GROUP_CHAT_ID
 
 from handlers.panel import refresh_shop_panel
+from handlers.supervisor import refresh_supervisor_daily_report
 
 from database.database import (
     get_user,
@@ -234,7 +235,6 @@ async def send_closing_summary(bot, summary_date: str):
 async def daily_check_scheduler(bot):
     """
     08:15 — утренние опросы.
-    08:30 — утренняя сводка.
     22:10 — вечерняя сводка.
     """
 
@@ -244,13 +244,17 @@ async def daily_check_scheduler(bot):
             check_date = now.date().isoformat()
 
             poll_time = now.replace(
-                hour=8, minute=15, second=0, microsecond=0
+                hour=8,
+                minute=15,
+                second=0,
+                microsecond=0
             )
-            morning_summary_time = now.replace(
-                hour=8, minute=30, second=0, microsecond=0
-            )
-            closing_summary_time = now.replace(
-                hour=22, minute=10, second=0, microsecond=0
+
+            closing_time = now.replace(
+                hour=22,
+                minute=10,
+                second=0,
+                microsecond=0
             )
 
             # Если бот запустился до 08:15 — ждём
@@ -258,32 +262,33 @@ async def daily_check_scheduler(bot):
                 await asyncio.sleep(
                     (poll_time - now).total_seconds()
                 )
+
                 await send_daily_checks(bot)
 
-            # Если бот запустился между 08:15 и 08:30
-            elif now < morning_summary_time:
-                await send_daily_checks(bot)
-
-            # Ждём 08:30, если время ещё не наступило
-            now = datetime.now(MOSCOW_TZ)
-
-            if now < morning_summary_time:
-                await asyncio.sleep(
-                    (morning_summary_time - now).total_seconds()
+            # Если бот запустился после 08:15,
+            # но до вечерней сводки — проверяем опросы
+            elif now < closing_time:
+                logging.info(
+                    "Бот запущен после времени утреннего опроса. "
+                    "Рассылка до следующего дня отключена."
                 )
-
-            # Утренняя сводка
-            await send_daily_summary(bot, check_date)
 
             # Ждём 22:10
             now = datetime.now(MOSCOW_TZ)
 
-            if now < closing_summary_time:
+            closing_time = now.replace(
+                hour=22,
+                minute=10,
+                second=0,
+                microsecond=0
+            )
+
+            if now < closing_time:
                 await asyncio.sleep(
-                    (closing_summary_time - now).total_seconds()
+                    (closing_time - now).total_seconds()
                 )
 
-            # Вечерняя сводка
+            # Вечерняя сводка остаётся в рабочей группе
             await send_closing_summary(bot, check_date)
 
             # Ждём следующего дня
@@ -310,7 +315,6 @@ async def daily_check_scheduler(bot):
                 "Ошибка планировщика ежедневных проверок"
             )
             await asyncio.sleep(60)
-
 @router.message_callback(
     F.callback.payload.startswith("daily_check:")
 )
@@ -351,13 +355,6 @@ async def daily_check_callback(event: MessageCallback):
         if check["shop_id"] != db_user["shop_id"]:
             return
 
-        # После 08:30 ответы уже не принимаются
-        deadline = datetime.fromisoformat(
-            f"{check['check_date']}T08:30:00+03:00"
-        )
-
-        if datetime.now(MOSCOW_TZ) >= deadline:
-            return
 
         saved = await answer_daily_check(
             check_id=check_id,
@@ -409,7 +406,13 @@ async def daily_check_callback(event: MessageCallback):
                 "Не удалось обновить состояние электричества магазина %s",
                 db_user["code"]
             )
-
+        # Автоматически обновляем статистику супервайзера
+        if db_user["supervisor_id"] is not None:
+            await refresh_supervisor_daily_report(
+                bot=event.bot,
+                supervisor_id=db_user["supervisor_id"],
+                check_date=check["check_date"]
+            )
         # Удаляем сообщение с кнопками после сохранения ответа
         try:
             await event.bot.delete_message(

@@ -1,7 +1,7 @@
 
 import aiosqlite
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import logging
@@ -13,6 +13,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "electricity.db"
 
 
 async def init_db():
+    logging.info("Путь к базе данных: %s", DB_PATH.resolve())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
 
@@ -82,6 +83,24 @@ async def init_db():
                 FOREIGN KEY (shop_id) REFERENCES shops(id)
             )
         """)
+        # Миграция: поля для отложенных уведомлений
+        cursor = await db.execute("PRAGMA table_info(outages)")
+        columns = [row[1] for row in await cursor.fetchall()]
+
+        if "notification_due_at" not in columns:
+            await db.execute(
+                "ALTER TABLE outages ADD COLUMN notification_due_at TEXT"
+            )
+
+        if "notification_sent_at" not in columns:
+            await db.execute(
+                "ALTER TABLE outages ADD COLUMN notification_sent_at TEXT"
+            )
+
+        if "restoration_sent_at" not in columns:
+            await db.execute(
+                "ALTER TABLE outages ADD COLUMN restoration_sent_at TEXT"
+            )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS daily_checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +130,14 @@ async def init_db():
                 summary_type TEXT NOT NULL,
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY (summary_date, summary_type)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS supervisor_daily_reports (
+                supervisor_id INTEGER NOT NULL,
+                check_date TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                PRIMARY KEY (supervisor_id, check_date)
             )
         """)
         await db.commit()
@@ -180,7 +207,8 @@ async def switch_power(
     started_at_override: str | None = None,
     ended_at_override: str | None = None
 ) -> dict:
-    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    now = datetime.now(MOSCOW_TZ)
+    now_iso = now.isoformat(timespec="seconds")
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -200,15 +228,29 @@ async def switch_power(
                     await db.rollback()
                     return {"status": "already_off"}
 
-                started_at = started_at_override or now
+                started_at = started_at_override or now_iso
 
-                await db.execute("""
-                    INSERT INTO outages (shop_id, started_at)
-                    VALUES (?, ?)
-                """, (shop_id, started_at))
+                due_at = (
+                    now + timedelta(seconds=60)
+                ).isoformat(timespec="seconds")
+
+                cursor = await db.execute("""
+                    INSERT INTO outages (
+                        shop_id,
+                        started_at,
+                        notification_due_at
+                    )
+                    VALUES (?, ?, ?)
+                """, (shop_id, started_at, due_at))
+
+                outage_id = cursor.lastrowid
 
                 await db.commit()
-                return {"status": "off"}
+
+                return {
+                    "status": "off",
+                    "outage_id": outage_id
+                }
 
             if action == "power_on":
                 if not outage:
@@ -216,7 +258,7 @@ async def switch_power(
                     return {"status": "already_on"}
 
                 started_at = datetime.fromisoformat(outage[1])
-                ended_at_value = ended_at_override or now
+                ended_at_value = ended_at_override or now_iso
                 ended_at = datetime.fromisoformat(ended_at_value)
 
                 total_seconds = max(
@@ -229,17 +271,29 @@ async def switch_power(
 
                 duration_text = f"{hours} ч. {minutes} мин."
 
-                await db.execute("""
-                    UPDATE outages
-                    SET ended_at = ?
-                    WHERE id = ?
-                """, (ended_at_value, outage[0]))
+                # Если отключение длилось меньше минуты,
+                # отменяем ожидающее уведомление.
+                if total_seconds < 60:
+                    await db.execute("""
+                        UPDATE outages
+                        SET ended_at = ?,
+                            notification_due_at = NULL
+                        WHERE id = ?
+                    """, (ended_at_value, outage[0]))
+                else:
+                    await db.execute("""
+                        UPDATE outages
+                        SET ended_at = ?
+                        WHERE id = ?
+                    """, (ended_at_value, outage[0]))
 
                 await db.commit()
 
                 return {
                     "status": "on",
-                    "duration": duration_text
+                    "duration": duration_text,
+                    "duration_seconds": total_seconds,
+                    "outage_id": outage[0]
                 }
 
             await db.rollback()
@@ -414,6 +468,7 @@ async def get_supervisor_shops(supervisor_id: int):
 
         return await cursor.fetchall()
 
+
 async def get_supervisor_history(
     supervisor_id: int,
     limit: int = 15
@@ -432,11 +487,19 @@ async def get_supervisor_history(
             FROM outages o
             JOIN shops s ON s.id = o.shop_id
             WHERE s.supervisor_id = ?
+            AND (
+                o.ended_at IS NULL
+                OR (
+                    julianday(o.ended_at) -
+                    julianday(o.started_at)
+                ) * 86400 >= 60
+            )
             ORDER BY o.id DESC
             LIMIT ?
         """, (supervisor_id, limit))
 
         return await cursor.fetchall()
+
 
 
 
@@ -700,4 +763,138 @@ async def mark_daily_summary_as_sent(
             datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
         ))
 
+        await db.commit()
+async def get_supervisor_daily_check_results(
+    supervisor_id: int,
+    check_date: str
+):
+    """Утренние ответы только по магазинам конкретного супервайзера."""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT
+                s.code,
+                s.address,
+                dc.status,
+                dc.answered_at
+            FROM daily_checks dc
+            JOIN shops s ON s.id = dc.shop_id
+            WHERE s.supervisor_id = ?
+              AND dc.check_date = ?
+            ORDER BY s.code
+        """, (supervisor_id, check_date))
+
+        return await cursor.fetchall()
+
+
+async def save_supervisor_daily_report(
+    supervisor_id: int,
+    check_date: str,
+    message_id: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO supervisor_daily_reports (
+                supervisor_id,
+                check_date,
+                message_id
+            )
+            VALUES (?, ?, ?)
+        """, (supervisor_id, check_date, str(message_id)))
+
+        await db.commit()
+
+
+async def get_supervisor_daily_report(
+    supervisor_id: int,
+    check_date: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            SELECT message_id
+            FROM supervisor_daily_reports
+            WHERE supervisor_id = ?
+              AND check_date = ?
+        """, (supervisor_id, check_date))
+
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def clear_supervisor_daily_report(
+    supervisor_id: int,
+    check_date: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            DELETE FROM supervisor_daily_reports
+            WHERE supervisor_id = ?
+              AND check_date = ?
+        """, (supervisor_id, check_date))
+
+        await db.commit()
+
+
+async def get_pending_group_notifications():
+    """Получает отключения, для которых пора отправить уведомления."""
+
+    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT
+                o.id AS outage_id,
+                o.started_at,
+                o.ended_at,
+                o.notification_sent_at,
+                o.restoration_sent_at,
+                s.code,
+                s.address
+            FROM outages o
+            JOIN shops s ON s.id = o.shop_id
+            WHERE (
+                o.notification_sent_at IS NULL
+                AND o.notification_due_at IS NOT NULL
+                AND o.notification_due_at <= ?
+            )
+            OR (
+                o.notification_sent_at IS NOT NULL
+                AND o.ended_at IS NOT NULL
+                AND o.restoration_sent_at IS NULL
+            )
+            ORDER BY o.id
+        """, (now,))
+
+        return await cursor.fetchall()
+
+
+async def mark_outage_notification_sent(outage_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE outages
+            SET notification_sent_at = ?
+            WHERE id = ?
+              AND notification_sent_at IS NULL
+        """, (
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            outage_id
+        ))
+        await db.commit()
+
+
+async def mark_restoration_notification_sent(outage_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE outages
+            SET restoration_sent_at = ?
+            WHERE id = ?
+              AND restoration_sent_at IS NULL
+        """, (
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            outage_id
+        ))
         await db.commit()
