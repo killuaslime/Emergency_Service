@@ -1,15 +1,13 @@
-
 import asyncio
 import logging
-
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from collections import defaultdict
 
 from maxapi import Router, F
 from maxapi.types import MessageCallback, CallbackButton
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
-
-from config import GROUP_CHAT_ID
 
 from handlers.panel import refresh_shop_panel
 from handlers.supervisor import refresh_supervisor_daily_report
@@ -18,63 +16,57 @@ from database.database import (
     get_user,
     get_daily_check_shops,
     create_daily_check,
+    claim_daily_check_delivery,
+    mark_daily_check_delivery_failed,
     save_daily_check_message,
     get_daily_check,
     answer_daily_check,
     get_daily_check_results,
     mark_daily_checks_summary_sent,
     has_pending_daily_summary,
-    get_latest_outage,
     switch_power,
     get_closing_summary_shops,
     has_daily_summary_been_sent,
-    mark_daily_summary_as_sent,
+    get_daily_summary_job,
+    save_daily_summary_job,
+    claim_daily_summary_job,
+    mark_daily_summary_job_sent,
 )
 
 router = Router()
-
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 def daily_keyboard(check_id: int):
     builder = InlineKeyboardBuilder()
-
-    builder.row(
-        CallbackButton(
-            text="🟢 Есть свет",
-            payload=f"daily_check:on:{check_id}"
-        )
-    )
-
-    builder.row(
-        CallbackButton(
-            text="🔴 Нет света",
-            payload=f"daily_check:off:{check_id}"
-        )
-    )
-
+    builder.row(CallbackButton(
+        text="🟢 Есть свет",
+        payload=f"daily_check:on:{check_id}"
+    ))
+    builder.row(CallbackButton(
+        text="🔴 Нет света",
+        payload=f"daily_check:off:{check_id}"
+    ))
     return builder.as_markup()
 
 
-async def send_daily_checks(bot):
-    now = datetime.now(MOSCOW_TZ)
-    check_date = now.date().isoformat()
-
+async def send_daily_checks(bot, check_date: str | None = None):
+    """Создаёт/доставляет опросы за дату; незавершённые отправки повторяются."""
+    check_date = check_date or datetime.now(MOSCOW_TZ).date().isoformat()
     shops = await get_daily_check_shops()
-
     logging.info(
-        "Начинаем утренний опрос. Магазинов: %s",
-        len(shops)
+        "Проверяем утренние опросы за %s. Магазинов: %s",
+        check_date, len(shops)
     )
 
     for shop in shops:
-        check_id = await create_daily_check(
-            shop["id"],
-            check_date
-        )
-
+        check_id = await create_daily_check(shop["id"], check_date)
         if check_id is None:
-            continue
+            continue  # Опрос уже доставлен.
+
+        claimed = await claim_daily_check_delivery(check_id, retry_after_seconds=60)
+        if not claimed:
+            continue  # Другая попытка ещё выполняется или не истёк интервал.
 
         try:
             sent = await bot.send_message(
@@ -88,233 +80,164 @@ async def send_daily_checks(bot):
                 ),
                 attachments=[daily_keyboard(check_id)]
             )
-
-            if (
-                sent is None
-                or sent.message is None
-                or sent.message.body is None
-            ):
-                raise RuntimeError(
-                    "MAX не вернул отправленное сообщение"
-                )
+            if sent is None or sent.message is None or sent.message.body is None:
+                raise RuntimeError("MAX не вернул отправленное сообщение")
 
             await save_daily_check_message(
                 check_id=check_id,
                 chat_id=shop["panel_chat_id"],
                 message_id=sent.message.body.mid
             )
-
-            logging.info(
-                "Опрос отправлен магазину %s",
-                shop["code"]
-            )
-
-        except Exception:
-            logging.exception(
-                "Не удалось отправить опрос магазину %s",
-                shop["code"]
-            )
+            logging.info("Опрос доставлен магазину %s", shop["code"])
+        except Exception as exc:
+            await mark_daily_check_delivery_failed(check_id, repr(exc))
+            logging.exception("Не удалось отправить опрос магазину %s", shop["code"])
 
 
 async def send_daily_summary(bot, check_date: str):
-    # Не отправляем сводку повторно
+    """Отправляет утреннюю сводку отдельно в группу каждого супервайзера."""
     if not await has_pending_daily_summary(check_date):
-        logging.info(
-            "Сводка за %s уже отправлена или опросов нет",
-            check_date
-        )
+        logging.info("Утренняя сводка за %s уже отправлена или опросов нет", check_date)
         return
 
     results = await get_daily_check_results(check_date)
-
     if not results:
+        logging.info("Нет результатов утреннего опроса за %s", check_date)
         return
 
-    messages = []
-
+    grouped = defaultdict(list)
     for shop in results:
-        code = shop["code"]
-        address = shop["address"]
-        status = shop["status"]
+        grouped[shop["group_chat_id"]].append(shop)
 
-        if status == "off":
-            emoji = "🔴"
-            status_text = "8:15 открыт без ЭЭ"
+    for group_id, group_shops in grouped.items():
+        messages = []
+        for shop in group_shops:
+            status = shop["status"]
+            if status == "off":
+                emoji, status_text = "🔴", "8:15 открыт без ЭЭ"
+            elif status == "on":
+                emoji, status_text = "🟢", "8:15 открыт с ЭЭ"
+            else:
+                emoji, status_text = "⚪", "8:15 нет ответа"
+            messages.append(f"{emoji} {shop['code']}\n{shop['address']}\n{status_text}")
 
-        elif status == "on":
-            emoji = "🟢"
-            status_text = "8:15 открыт с ЭЭ"
-
-        else:
-            emoji = "⚪"
-            status_text = "8:15 нет ответа"
-
-        message = (
-            f"{emoji} {code}\n"
-            f"{address}\n"
-            f"{status_text}"
-        )
-
-        messages.append(message)
-
-    text = "\n\n".join(messages)
-
-    await bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=text
-    )
+        await bot.send_message(chat_id=group_id, text="\n\n".join(messages))
 
     await mark_daily_checks_summary_sent(check_date)
+    logging.info("Утренние сводки за %s отправлены. Магазинов: %s", check_date, len(results))
 
-    logging.info(
-        "Утренняя сводка за %s отправлена. Магазинов: %s",
-        check_date,
-        len(results)
-    )
-async def send_closing_summary(bot, summary_date: str):
-    """
-    Вечерняя сводка в 22:10.
-    """
 
+
+def build_closing_summary(shops) -> str:
+    """Формирует согласованный вечерний отчёт; unknown никогда не маскируется под on."""
+    if not shops:
+        return "Вечерний отчёт\n\nНет зарегистрированных магазинов для отчёта"
+
+    if all(shop["status"] == "on" for shop in shops):
+        return "Вечерний отчёт\n\n🟢 Все магазины закрылись со светом"
+
+    messages = []
+    for shop in shops:
+        if shop["status"] == "off":
+            messages.append(
+                f"❌ №{shop['code']}\n{shop['address']}\nЗакрыт без ЭЭ"
+            )
+
+    return "Вечерний отчёт\n\n" + "\n\n".join(messages)
+
+
+
+
+
+async def send_closing_summary(bot, summary_date):
     if await has_daily_summary_been_sent(
-        summary_date,
-        "closing"
+        summary_date, "closing"
     ):
-        logging.info(
-            "Вечерняя сводка за %s уже отправлена",
-            summary_date
-        )
         return
 
-    shops = await get_closing_summary_shops()
+    shops = await get_closing_summary_shops(summary_date)
 
     if not shops:
         logging.warning(
-            "Нет зарегистрированных магазинов для вечерней сводки"
-        )
-        await mark_daily_summary_as_sent(
-            summary_date,
-            "closing"
+            "Нет магазинов для вечернего отчёта"
         )
         return
 
-    messages = []
+    grouped = defaultdict(list)
 
     for shop in shops:
-        if shop["status"] == "off":
-            emoji = "🔴"
-            status_text = "Закрыт без ЭЭ"
-        else:
-            emoji = "🟢"
-            status_text = "Закрыт с ЭЭ"
+        grouped[shop["group_chat_id"]].append(shop)
 
-        messages.append(
-            f"{emoji} №{shop['code']}\n"
-            f"{shop['address']}\n"
-            f"{status_text}"
+    for group_id, group_shops in grouped.items():
+        messages = []
+
+        for shop in group_shops:
+            if shop["status"] == "off":
+                messages.append(
+                    f"❌ №{shop['code']}\n"
+                    f"{shop['address']}\n"
+                    "Закрыт без ЭЭ"
+                )
+
+            elif shop["status"] == "unknown":
+                messages.append(
+                    f"⚠️ №{shop['code']}\n"
+                    f"{shop['address']}\n"
+                    "Нет подтверждения статуса"
+                )
+
+        if not messages:
+            report = (
+                "Вечерний отчёт\n\n"
+                "🟢 Все магазины закрылись со светом"
+            )
+        else:
+            report = (
+                "Вечерний отчёт\n\n"
+                + "\n\n".join(messages)
+            )
+
+        await bot.send_message(
+            chat_id=group_id,
+            text=report
         )
 
-    text = "\n\n".join(messages)
-
-    await bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=text
-    )
-
     await mark_daily_summary_as_sent(
-        summary_date,
-        "closing"
+        summary_date, "closing"
     )
 
-    logging.info(
-        "Вечерняя сводка за %s отправлена. Магазинов: %s",
-        summary_date,
-        len(shops)
-    )
 
 async def daily_check_scheduler(bot):
-    """
-    08:15 — утренние опросы.
-    22:10 — вечерняя сводка.
-    """
+    """Проверяет задачи регулярно: 08:15 — опросы, 22:10 — вечерний отчёт.
 
+    При старте после планового времени выполняет пропущенную задачу за текущую
+    московскую дату. Не полагается на один длинный asyncio.sleep.
+    """
+    logging.info("Планировщик ежедневных опросов запущен (Europe/Moscow)")
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
-            check_date = now.date().isoformat()
+            today = now.date().isoformat()
+            poll_time = now.replace(hour=8, minute=15, second=0, microsecond=0)
+            closing_time = now.replace(hour=22, minute=10, second=0, microsecond=0)
 
-            poll_time = now.replace(
-                hour=8,
-                minute=15,
-                second=0,
-                microsecond=0
-            )
+            if now >= poll_time:
+                await send_daily_checks(bot, today)
 
-            closing_time = now.replace(
-                hour=22,
-                minute=10,
-                second=0,
-                microsecond=0
-            )
+            if now >= closing_time:
+                await send_closing_summary(bot, today)
 
-            # Если бот запустился до 08:15 — ждём
-            if now < poll_time:
-                await asyncio.sleep(
-                    (poll_time - now).total_seconds()
-                )
-
-                await send_daily_checks(bot)
-
-            # Если бот запустился после 08:15,
-            # но до вечерней сводки — проверяем опросы
-            elif now < closing_time:
-                logging.info(
-                    "Бот запущен после времени утреннего опроса. "
-                    "Рассылка до следующего дня отключена."
-                )
-
-            # Ждём 22:10
-            now = datetime.now(MOSCOW_TZ)
-
-            closing_time = now.replace(
-                hour=22,
-                minute=10,
-                second=0,
-                microsecond=0
-            )
-
-            if now < closing_time:
-                await asyncio.sleep(
-                    (closing_time - now).total_seconds()
-                )
-
-            # Вечерняя сводка остаётся в рабочей группе
-            await send_closing_summary(bot, check_date)
-
-            # Ждём следующего дня
-            now = datetime.now(MOSCOW_TZ)
-
-            next_poll = now.replace(
-                hour=8,
-                minute=15,
-                second=0,
-                microsecond=0
-            ) + timedelta(days=1)
-
-            logging.info(
-                "Следующий утренний опрос: %s",
-                next_poll.strftime("%d.%m.%Y %H:%M:%S")
-            )
-
-            await asyncio.sleep(
-                (next_poll - now).total_seconds()
-            )
-
+            # Короткий цикл даёт восстановление после ошибки/перезапуска и
+            # не держит процесс в одном sleep до следующего события.
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            logging.info("Планировщик ежедневных опросов остановлен")
+            raise
         except Exception:
-            logging.exception(
-                "Ошибка планировщика ежедневных проверок"
-            )
-            await asyncio.sleep(60)
+            logging.exception("Ошибка планировщика ежедневных проверок")
+            await asyncio.sleep(30)
+
+
 @router.message_callback(
     F.callback.payload.startswith("daily_check:")
 )

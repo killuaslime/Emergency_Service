@@ -6,7 +6,6 @@ from maxapi import Router, F
 from maxapi.types import MessageCreated, MessageCallback, CallbackButton
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
-from config import GROUP_CHAT_ID
 
 from database.database import (
     get_user,
@@ -281,7 +280,7 @@ async def group_notification_scheduler(bot):
                         )
 
                         await bot.send_message(
-                            chat_id=GROUP_CHAT_ID,
+                            chat_id=outage["group_chat_id"],
                             text=off_text
                         )
 
@@ -312,7 +311,7 @@ async def group_notification_scheduler(bot):
                         )
 
                         await bot.send_message(
-                            chat_id=GROUP_CHAT_ID,
+                            chat_id=outage["group_chat_id"],
                             text=on_text
                         )
 

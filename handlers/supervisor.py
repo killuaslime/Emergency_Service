@@ -1,4 +1,3 @@
-
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -9,7 +8,6 @@ from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
 from database.database import (
     get_supervisor_shops,
-    get_supervisor_history,
     get_supervisor_daily_check_results,
     save_supervisor_daily_report,
     get_supervisor_daily_report,
@@ -19,6 +17,7 @@ from services.supervisors import get_supervisor_by_id
 
 router = Router()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
 
 def format_datetime(value):
     if not value:
@@ -50,6 +49,8 @@ def calculate_duration(start, end=None):
 
     parts.append(f"{minutes} мин.")
     return " ".join(parts)
+
+
 async def get_daily_stats_text(supervisor_id: int, check_date: str):
     results = await get_supervisor_daily_check_results(
         supervisor_id,
@@ -80,39 +81,36 @@ async def get_daily_stats_text(supervisor_id: int, check_date: str):
             lines.append(
                 f"❌ №{shop['code']}\n"
                 f"{shop['address']}\n"
-                f"Открылся без ЭЭ в 08:15"
+                "Открылся без ЭЭ в 08:15"
             )
-
         elif shop["status"] is None:
             lines.append(
                 f"⚪ №{shop['code']}\n"
                 f"{shop['address']}\n"
-                f"Ожидается ответ"
+                "Ожидается ответ"
             )
 
     return "\n\n".join(lines)
+
 
 def create_keyboard(view="menu"):
     builder = InlineKeyboardBuilder()
 
     if view == "menu":
+        # Главное меню: четыре кнопки в два ряда. Кнопка «История» удалена.
         builder.row(
-            CallbackButton(text="🏪 Мои магазины", payload="sv:shops")
-        )
-        builder.row(
-            CallbackButton(text="📊 Текущая ситуация", payload="sv:status")
+            CallbackButton(text="🏪 Мои магазины", payload="sv:shops"),
+            CallbackButton(text="📊 Текущая ситуация", payload="sv:status"),
         )
         builder.row(
             CallbackButton(
                 text="🌅 Утренняя статистика",
                 payload="sv:daily_stats"
-            )
-        )
-        builder.row(
-            CallbackButton(text="🔴/🟢 Детали отключения", payload="sv:details")
-        )
-        builder.row(
-            CallbackButton(text="📚 История", payload="sv:history")
+            ),
+            CallbackButton(
+                text="🔴/🟢 Детали отключения",
+                payload="sv:details"
+            ),
         )
     else:
         builder.row(
@@ -124,6 +122,7 @@ def create_keyboard(view="menu"):
 
 async def get_view_text(supervisor_id, view):
     shops = await get_supervisor_shops(supervisor_id)
+
     if view == "menu":
         return (
             "👨‍💼 ПАНЕЛЬ СУПЕРВАЙЗЕРА\n\n"
@@ -136,7 +135,6 @@ async def get_view_text(supervisor_id, view):
             supervisor_id,
             check_date
         )
-
 
     if view == "shops":
         if not shops:
@@ -188,14 +186,13 @@ async def get_view_text(supervisor_id, view):
                 lines.append(
                     f"🟡 {shop['code']}\n"
                     f"{shop['address']}\n"
-                    f"Регистрация: 🟡 Ожидает подтверждения"
+                    "Регистрация: 🟡 Ожидает подтверждения"
                 )
-
             else:
                 lines.append(
                     f"⚪ {shop['code']}\n"
                     f"{shop['address']}\n"
-                    f"Регистрация: 🔴 Не зарегистрирован"
+                    "Регистрация: 🔴 Не зарегистрирован"
                 )
 
         lines.append(
@@ -206,8 +203,6 @@ async def get_view_text(supervisor_id, view):
         )
 
         return "\n\n".join(lines)
-
-
 
     if view == "status":
         total = len(shops)
@@ -248,35 +243,6 @@ async def get_view_text(supervisor_id, view):
 
         return "\n".join(lines)
 
-    if view == "history":
-        history = await get_supervisor_history(supervisor_id)
-
-        if not history:
-            return "📚 ИСТОРИЯ\n\nОтключений пока не было."
-
-        lines = ["📚 ИСТОРИЯ ОТКЛЮЧЕНИЙ\n"]
-
-        for item in history:
-            ended = item["ended_at"]
-
-            if ended:
-                duration = calculate_duration(
-                    item["started_at"], ended
-                )
-                status = f"Продолжительность: {duration}"
-            else:
-                status = "🔴 Отключение ещё продолжается"
-
-            lines.append(
-                f"Магазин: {item['code']}\n"
-                f"Адрес: {item['address']}\n"
-                f"Начало: {format_datetime(item['started_at'])}\n"
-                f"Окончание: {format_datetime(ended)}\n"
-                f"{status}\n"
-            )
-
-        return "\n".join(lines)
-
     return "Неизвестный раздел."
 
 
@@ -295,7 +261,6 @@ async def show_supervisor_panel(event, supervisor):
         "sv:shops",
         "sv:status",
         "sv:details",
-        "sv:history",
         "sv:daily_stats",
     ])
 )
@@ -315,7 +280,6 @@ async def supervisor_callback(event: MessageCallback):
             return
 
         view = event.callback.payload.split(":", 1)[1]
-
         check_date = datetime.now(MOSCOW_TZ).date().isoformat()
 
         edited = await event.bot.edit_message(
@@ -344,16 +308,10 @@ async def supervisor_callback(event: MessageCallback):
             edited.success
         )
 
-        logging.info(
-            "Панель супервайзера обновлена: view=%s success=%s",
-            view,
-            edited.success
-        )
-
     except Exception:
-        logging.exception(
-            "Ошибка панели супервайзера"
-        )
+        logging.exception("Ошибка панели супервайзера")
+
+
 async def refresh_supervisor_daily_report(
     bot,
     supervisor_id: int,

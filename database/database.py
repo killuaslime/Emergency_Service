@@ -13,7 +13,7 @@ DB_PATH = Path(__file__).resolve().parent.parent / "electricity.db"
 
 
 async def init_db():
-    logging.info("Путь к базе данных: %s", DB_PATH.resolve())
+    logging.debug("Путь к базе данных: %s", DB_PATH.resolve())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
 
@@ -53,7 +53,14 @@ async def init_db():
                 FOREIGN KEY (shop_id) REFERENCES shops(id)
             )
         """)
-
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS supervisors (
+                max_user_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                group_chat_id INTEGER NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS registration_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,7 +130,48 @@ async def init_db():
             await db.execute(
                 "ALTER TABLE daily_checks ADD COLUMN summary_sent_at TEXT"
             )
-                # Журнал отправки утренних и вечерних сводок
+
+        # Состояние доставки опроса. Старые успешно отправленные сообщения
+        # определяем по сохранённому message_id.
+        if "delivery_attempts" not in columns:
+            await db.execute(
+                "ALTER TABLE daily_checks ADD COLUMN delivery_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_delivery_attempt_at" not in columns:
+            await db.execute(
+                "ALTER TABLE daily_checks ADD COLUMN last_delivery_attempt_at TEXT"
+            )
+        if "delivery_error" not in columns:
+            await db.execute(
+                "ALTER TABLE daily_checks ADD COLUMN delivery_error TEXT"
+            )
+
+        # Снимок текста вечернего отчёта хранится до отправки.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_summary_jobs (
+                summary_date TEXT NOT NULL,
+                summary_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                sent_at TEXT,
+                last_attempt_at TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (summary_date, summary_type)
+            )
+        """)
+        summary_job_columns_cursor = await db.execute(
+            "PRAGMA table_info(daily_summary_jobs)"
+        )
+        summary_job_columns = [row[1] for row in await summary_job_columns_cursor.fetchall()]
+        if "last_attempt_at" not in summary_job_columns:
+            await db.execute(
+                "ALTER TABLE daily_summary_jobs ADD COLUMN last_attempt_at TEXT"
+            )
+        if "attempts" not in summary_job_columns:
+            await db.execute(
+                "ALTER TABLE daily_summary_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        # Журнал отправки утренних и вечерних сводок
         await db.execute("""
             CREATE TABLE IF NOT EXISTS daily_summary_log (
                 summary_date TEXT NOT NULL,
@@ -525,26 +573,77 @@ async def get_daily_check_shops():
         return await cursor.fetchall()
 
 async def create_daily_check(shop_id: int, check_date: str):
-    """Создаёт ежедневный опрос, не допуская дубликатов."""
+    """Создаёт опрос или возвращает ID ещё не доставленного опроса.
 
+    Возвращает None только если сообщение уже доставлено. Благодаря этому
+    повторный запуск планировщика подхватывает незавершённые отправки.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("""
             INSERT OR IGNORE INTO daily_checks (
                 shop_id, check_date, sent_at
-            )
-            VALUES (?, ?, ?)
+            ) VALUES (?, ?, ?)
         """, (
             shop_id,
             check_date,
             datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
         ))
 
+        if cursor.rowcount:
+            check_id = cursor.lastrowid
+            await db.commit()
+            return check_id
+
+        cursor = await db.execute("""
+            SELECT id, message_id
+            FROM daily_checks
+            WHERE shop_id = ? AND check_date = ?
+        """, (shop_id, check_date))
+        row = await cursor.fetchone()
         await db.commit()
-
-        if cursor.rowcount == 0:
+        if row is None or row[1] is not None:
             return None
+        return row[0]
 
-        return cursor.lastrowid
+
+async def claim_daily_check_delivery(
+    check_id: int,
+    retry_after_seconds: int = 60
+) -> bool:
+    """Атомарно захватывает попытку отправки; защищает от частых повторов."""
+    now = datetime.now(MOSCOW_TZ)
+    now_iso = now.isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute("""
+                UPDATE daily_checks
+                SET delivery_attempts = COALESCE(delivery_attempts, 0) + 1,
+                    last_delivery_attempt_at = ?,
+                    delivery_error = NULL
+                WHERE id = ?
+                  AND message_id IS NULL
+                  AND (
+                    last_delivery_attempt_at IS NULL
+                    OR julianday(?) - julianday(last_delivery_attempt_at)
+                       >= (? / 86400.0)
+                  )
+            """, (now_iso, check_id, now_iso, retry_after_seconds))
+            await db.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def mark_daily_check_delivery_failed(check_id: int, error: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE daily_checks
+            SET delivery_error = ?
+            WHERE id = ? AND message_id IS NULL
+        """, (str(error)[:1000], check_id))
+        await db.commit()
 
 
 async def save_daily_check_message(
@@ -556,9 +655,10 @@ async def save_daily_check_message(
         await db.execute("""
             UPDATE daily_checks
             SET message_chat_id = ?,
-                message_id = ?
+                message_id = ?,
+                delivery_error = NULL
             WHERE id = ?
-        """, (chat_id, message_id, check_id))
+        """, (chat_id, str(message_id), check_id))
 
         await db.commit()
 
@@ -655,11 +755,14 @@ async def get_daily_check_results(check_date: str):
             SELECT
                 s.code,
                 s.address,
-                dc.status
+                dc.status,
+                sv.group_chat_id
             FROM daily_checks dc
             JOIN shops s ON s.id = dc.shop_id
+            JOIN supervisors sv ON sv.max_user_id = s.supervisor_id
             WHERE dc.check_date = ?
-            ORDER BY s.code
+              AND sv.is_active = 1
+            ORDER BY sv.max_user_id, s.code
         """, (check_date,))
 
         return await cursor.fetchall()
@@ -692,40 +795,45 @@ async def has_pending_daily_summary(check_date: str) -> bool:
 
         return await cursor.fetchone() is not None
 
-async def get_closing_summary_shops():
-    """
-    Возвращает зарегистрированные магазины
-    и их состояние электричества на момент вызова.
-    """
+async def get_closing_summary_shops(summary_date: str):
+    """Состояние зарегистрированных магазинов на дату вечернего отчёта.
 
+    Открытое отключение имеет приоритет. Если отключения нет, учитываем
+    утренний ответ: отсутствие ответа считается unknown.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-
         cursor = await db.execute("""
             SELECT
                 s.id,
                 s.code,
                 s.address,
+                sv.group_chat_id,
                 CASE
                     WHEN EXISTS (
                         SELECT 1
                         FROM outages o
                         WHERE o.shop_id = s.id
                           AND o.ended_at IS NULL
-                    )
-                    THEN 'off'
+                    ) THEN 'off'
+                    WHEN dc.status IS NULL THEN 'unknown'
                     ELSE 'on'
                 END AS status
             FROM shops s
-            WHERE EXISTS (
-                SELECT 1
-                FROM users u
-                WHERE u.shop_id = s.id
-                  AND u.is_active = 1
-            )
-            ORDER BY s.code
-        """)
-
+            JOIN supervisors sv
+                ON sv.max_user_id = s.supervisor_id
+            LEFT JOIN daily_checks dc
+                ON dc.shop_id = s.id
+               AND dc.check_date = ?
+            WHERE sv.is_active = 1
+              AND EXISTS (
+                  SELECT 1
+                  FROM users u
+                  WHERE u.shop_id = s.id
+                    AND u.is_active = 1
+              )
+            ORDER BY sv.max_user_id, s.code
+        """, (summary_date,))
         return await cursor.fetchall()
 
 
@@ -764,6 +872,84 @@ async def mark_daily_summary_as_sent(
         ))
 
         await db.commit()
+
+
+async def get_daily_summary_job(summary_date: str, summary_type: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT payload, sent_at
+            FROM daily_summary_jobs
+            WHERE summary_date = ? AND summary_type = ?
+        """, (summary_date, summary_type))
+        return await cursor.fetchone()
+
+
+async def save_daily_summary_job(
+    summary_date: str,
+    summary_type: str,
+    payload: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO daily_summary_jobs (
+                summary_date, summary_type, payload, created_at
+            ) VALUES (?, ?, ?, ?)
+        """, (
+            summary_date,
+            summary_type,
+            payload,
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+        ))
+        await db.commit()
+
+
+async def claim_daily_summary_job(
+    summary_date: str,
+    summary_type: str,
+    retry_after_seconds: int = 600
+) -> bool:
+    """Атомарно захватывает отправку отчёта для защиты от параллельных дублей."""
+    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute("""
+                UPDATE daily_summary_jobs
+                SET last_attempt_at = ?,
+                    attempts = COALESCE(attempts, 0) + 1
+                WHERE summary_date = ?
+                  AND summary_type = ?
+                  AND sent_at IS NULL
+                  AND (
+                    last_attempt_at IS NULL
+                    OR julianday(?) - julianday(last_attempt_at)
+                       >= (? / 86400.0)
+                  )
+            """, (now, summary_date, summary_type, now, retry_after_seconds))
+            await db.commit()
+            return cursor.rowcount == 1
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def mark_daily_summary_job_sent(summary_date: str, summary_type: str):
+    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE daily_summary_jobs
+            SET sent_at = COALESCE(sent_at, ?)
+            WHERE summary_date = ? AND summary_type = ?
+        """, (now, summary_date, summary_type))
+        await db.execute("""
+            INSERT OR IGNORE INTO daily_summary_log (
+                summary_date, summary_type, sent_at
+            ) VALUES (?, ?, ?)
+        """, (summary_date, summary_type, now))
+        await db.commit()
+
+
 async def get_supervisor_daily_check_results(
     supervisor_id: int,
     check_date: str
@@ -853,19 +1039,24 @@ async def get_pending_group_notifications():
                 o.notification_sent_at,
                 o.restoration_sent_at,
                 s.code,
-                s.address
+                s.address,
+                sv.group_chat_id
             FROM outages o
             JOIN shops s ON s.id = o.shop_id
-            WHERE (
-                o.notification_sent_at IS NULL
-                AND o.notification_due_at IS NOT NULL
-                AND o.notification_due_at <= ?
-            )
-            OR (
-                o.notification_sent_at IS NOT NULL
-                AND o.ended_at IS NOT NULL
-                AND o.restoration_sent_at IS NULL
-            )
+            JOIN supervisors sv ON sv.max_user_id = s.supervisor_id
+            WHERE sv.is_active = 1
+              AND (
+                  (
+                      o.notification_sent_at IS NULL
+                      AND o.notification_due_at IS NOT NULL
+                      AND o.notification_due_at <= ?
+                  )
+                  OR (
+                      o.notification_sent_at IS NOT NULL
+                      AND o.ended_at IS NOT NULL
+                      AND o.restoration_sent_at IS NULL
+                  )
+              )
             ORDER BY o.id
         """, (now,))
 
@@ -898,3 +1089,63 @@ async def mark_restoration_notification_sent(outage_id: int):
             outage_id
         ))
         await db.commit()
+
+async def sync_supervisors_from_json():
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "supervisors.json"
+    )
+
+    with open(path, "r", encoding="utf-8") as file:
+        supervisors = json.load(file)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        for supervisor in supervisors:
+            await db.execute("""
+                INSERT INTO supervisors (
+                    max_user_id,
+                    name,
+                    group_chat_id,
+                    is_active
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(max_user_id) DO UPDATE SET
+                    name = excluded.name,
+                    group_chat_id = excluded.group_chat_id,
+                    is_active = excluded.is_active
+            """, (
+                supervisor["max_user_id"],
+                supervisor["name"],
+                supervisor["group_chat_id"],
+                int(supervisor.get("active", True))
+            ))
+
+        await db.commit()
+
+async def get_supervisor_group(supervisor_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT group_chat_id
+            FROM supervisors
+            WHERE max_user_id = ?
+              AND is_active = 1
+        """, (supervisor_id,))
+
+        return await cursor.fetchone()
+
+async def get_shop_group(shop_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT sv.group_chat_id
+            FROM shops s
+            JOIN supervisors sv
+                ON sv.max_user_id = s.supervisor_id
+            WHERE s.id = ?
+              AND sv.is_active = 1
+        """, (shop_id,))
+
+        return await cursor.fetchone()
