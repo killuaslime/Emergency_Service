@@ -1149,3 +1149,21 @@ async def get_shop_group(shop_id: int):
         """, (shop_id,))
 
         return await cursor.fetchone()
+
+
+async def update_daily_summary_job_payload(
+    summary_date: str,
+    summary_type: str,
+    payload: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE daily_summary_jobs
+            SET payload = ?
+            WHERE summary_date = ?
+              AND summary_type = ?
+            """,
+            (payload, summary_date, summary_type)
+        )
+        await db.commit()

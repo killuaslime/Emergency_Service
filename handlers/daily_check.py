@@ -2,7 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
+import aiosqlite
+import json
 from collections import defaultdict
 
 from maxapi import Router, F
@@ -31,6 +32,7 @@ from database.database import (
     save_daily_summary_job,
     claim_daily_summary_job,
     mark_daily_summary_job_sent,
+    update_daily_summary_job_payload,
 )
 
 router = Router()
@@ -145,22 +147,16 @@ def build_closing_summary(shops) -> str:
 
     return "Вечерний отчёт\n\n" + "\n\n".join(messages)
 
-
-
-
-
 async def send_closing_summary(bot, summary_date):
-    if await has_daily_summary_been_sent(
-        summary_date, "closing"
-    ):
+    summary_type = "closing"
+
+    if await has_daily_summary_been_sent(summary_date, summary_type):
         return
 
     shops = await get_closing_summary_shops(summary_date)
 
     if not shops:
-        logging.warning(
-            "Нет магазинов для вечернего отчёта"
-        )
+        logging.warning("Нет магазинов для вечернего отчёта")
         return
 
     grouped = defaultdict(list)
@@ -168,74 +164,238 @@ async def send_closing_summary(bot, summary_date):
     for shop in shops:
         grouped[shop["group_chat_id"]].append(shop)
 
-    for group_id, group_shops in grouped.items():
-        messages = []
+    job = await get_daily_summary_job(summary_date, summary_type)
 
-        for shop in group_shops:
-            if shop["status"] == "off":
-                messages.append(
-                    f"❌ №{shop['code']}\n"
-                    f"{shop['address']}\n"
-                    "Закрыт без ЭЭ"
+    if job is None:
+        reports = {}
+
+        for group_id, group_shops in grouped.items():
+            messages = []
+
+            for shop in group_shops:
+                if shop["status"] == "off":
+                    messages.append(
+                        f"❌ №{shop['code']}\n"
+                        f"{shop['address']}\n"
+                        "Закрыт без ЭЭ"
+                    )
+
+                elif shop["status"] == "unknown":
+                    messages.append(
+                        f"⚠️ №{shop['code']}\n"
+                        f"{shop['address']}\n"
+                        "Нет подтверждения статуса"
+                    )
+
+            if messages:
+                report = (
+                    "Вечерний отчёт\n\n"
+                    + "\n\n".join(messages)
+                )
+            else:
+                report = (
+                    "Вечерний отчёт\n\n"
+                    "🟢 Все магазины закрылись со светом"
                 )
 
-            elif shop["status"] == "unknown":
-                messages.append(
-                    f"⚠️ №{shop['code']}\n"
-                    f"{shop['address']}\n"
-                    "Нет подтверждения статуса"
-                )
+            reports[str(group_id)] = report
 
-        if not messages:
-            report = (
-                "Вечерний отчёт\n\n"
-                "🟢 Все магазины закрылись со светом"
-            )
-        else:
-            report = (
-                "Вечерний отчёт\n\n"
-                + "\n\n".join(messages)
-            )
+        payload = {
+            "reports": reports,
+            "sent_groups": []
+        }
 
-        await bot.send_message(
-            chat_id=group_id,
-            text=report
+        await save_daily_summary_job(
+            summary_date,
+            summary_type,
+            json.dumps(payload, ensure_ascii=False)
         )
 
-    await mark_daily_summary_as_sent(
-        summary_date, "closing"
+    else:
+        payload = json.loads(job["payload"])
+
+        # Совместимость с ранее сохранённым форматом.
+        if "reports" not in payload:
+            sent_groups = payload.pop("_sent_groups", [])
+
+            payload = {
+                "reports": payload,
+                "sent_groups": sent_groups
+            }
+
+            await update_daily_summary_job_payload(
+                summary_date,
+                summary_type,
+                json.dumps(payload, ensure_ascii=False)
+            )
+
+    claimed = await claim_daily_summary_job(
+        summary_date,
+        summary_type,
+        retry_after_seconds=600
     )
+
+    if not claimed:
+        return
+
+    job = await get_daily_summary_job(summary_date, summary_type)
+    payload = json.loads(job["payload"])
+
+    reports = payload["reports"]
+    sent_groups = set(payload["sent_groups"])
+
+    for group_id, report in reports.items():
+        if group_id in sent_groups:
+            continue
+
+        chat_id = (
+            int(group_id)
+            if group_id.lstrip("-").isdigit()
+            else group_id
+        )
+
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=report
+            )
+
+            sent_groups.add(group_id)
+
+            payload["sent_groups"] = list(sent_groups)
+
+            await update_daily_summary_job_payload(
+                summary_date,
+                summary_type,
+                json.dumps(payload, ensure_ascii=False)
+            )
+
+            logging.info(
+                "Вечерний отчёт отправлен в группу %s за %s",
+                group_id,
+                summary_date
+            )
+
+        except Exception:
+            logging.exception(
+                "Не удалось отправить вечерний отчёт в группу %s",
+                group_id
+            )
+
+    if sent_groups >= set(reports.keys()):
+        await mark_daily_summary_job_sent(
+            summary_date,
+            summary_type
+        )
+        logging.info(
+            "Вечерний отчёт за %s полностью доставлен",
+            summary_date
+        )
+    else:
+        logging.warning(
+            "Вечерний отчёт за %s доставлен не всем группам. "
+            "Успешно: %s из %s",
+            summary_date,
+            len(sent_groups),
+            len(reports)
+        )
 
 
 async def daily_check_scheduler(bot):
-    """Проверяет задачи регулярно: 08:15 — опросы, 22:10 — вечерний отчёт.
-
-    При старте после планового времени выполняет пропущенную задачу за текущую
-    московскую дату. Не полагается на один длинный asyncio.sleep.
     """
-    logging.info("Планировщик ежедневных опросов запущен (Europe/Moscow)")
+    08:15 — утренние опросы.
+    22:10 — вечерний отчёт.
+
+    Без постоянного опроса каждые 30 секунд.
+    Поддерживает восстановление после перезапуска.
+    """
+
+    logging.info("Планировщик запущен (Europe/Moscow)")
+
+    last_morning_date = None
+    last_closing_date = None
+
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
             today = now.date().isoformat()
-            poll_time = now.replace(hour=8, minute=15, second=0, microsecond=0)
-            closing_time = now.replace(hour=22, minute=10, second=0, microsecond=0)
 
-            if now >= poll_time:
+            poll_time = now.replace(
+                hour=8, minute=15, second=0, microsecond=0
+            )
+
+            closing_time = now.replace(
+                hour=22, minute=10, second=0, microsecond=0
+            )
+
+            # Утренний опрос
+            if now >= poll_time and last_morning_date != today:
+                logging.info("Запуск утренних опросов за %s", today)
+
                 await send_daily_checks(bot, today)
+                last_morning_date = today
 
-            if now >= closing_time:
+            # Вечерний отчёт
+            if now >= closing_time and last_closing_date != today:
+                logging.info("Запуск вечернего отчёта за %s", today)
+
                 await send_closing_summary(bot, today)
 
-            # Короткий цикл даёт восстановление после ошибки/перезапуска и
-            # не держит процесс в одном sleep до следующего события.
-            await asyncio.sleep(30)
+                if await has_daily_summary_been_sent(today, "closing"):
+                    last_closing_date = today
+                    logging.info("Вечерний отчёт успешно доставлен")
+                else:
+                    logging.warning(
+                        "Отчёт доставлен не полностью. "
+                        "Следующая попытка через 10 минут"
+                    )
+
+            # Определяем следующее событие
+            now = datetime.now(MOSCOW_TZ)
+            today = now.date().isoformat()
+
+            poll_time = now.replace(
+                hour=8, minute=15, second=0, microsecond=0
+            )
+
+            closing_time = now.replace(
+                hour=22, minute=10, second=0, microsecond=0
+            )
+
+            if last_morning_date != today and now < poll_time:
+                next_run = poll_time
+
+            elif last_closing_date != today and now < closing_time:
+                next_run = closing_time
+
+            elif last_closing_date != today and now >= closing_time:
+                # Повторная доставка неуспешного вечернего отчёта
+                next_run = now + timedelta(minutes=10)
+
+            else:
+                # Следующий день, 08:15
+                next_run = (now + timedelta(days=1)).replace(
+                    hour=8, minute=15, second=0, microsecond=0
+                )
+
+            sleep_seconds = max(
+                1, (next_run - now).total_seconds()
+            )
+
+            logging.info(
+                "Следующая задача: %s",
+                next_run.strftime("%d.%m.%Y %H:%M:%S")
+            )
+
+            await asyncio.sleep(sleep_seconds)
+
         except asyncio.CancelledError:
-            logging.info("Планировщик ежедневных опросов остановлен")
+            logging.info("Планировщик остановлен")
             raise
+
         except Exception:
-            logging.exception("Ошибка планировщика ежедневных проверок")
-            await asyncio.sleep(30)
+            logging.exception("Ошибка планировщика")
+            await asyncio.sleep(5)
 
 
 @router.message_callback(
