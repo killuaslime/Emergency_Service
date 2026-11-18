@@ -220,16 +220,17 @@ def schedule_message_deletion(bot, message_id):
     task.add_done_callback(_temporary_message_tasks.discard)
 
 
+
 async def process_daily_check_reminders(bot):
     """
-    Обрабатывает напоминания по опросу 08:15.
+    Обрабатывает напоминания по утреннему опросу.
 
     Стадии:
     0 — 09:15, первое напоминание.
     1 — 09:30, второе напоминание.
-    2 — 10:00, последнее напоминание магазину.
-    3 — 10:15, уведомление супервайзеру.
-    4+ — повторные напоминания каждый час.
+    2 — 10:00, последнее напоминание.
+    3 — пропуск уведомления супервайзеру.
+    4+ — повторные напоминания магазину каждый час.
     """
 
     today = datetime.now(MOSCOW_TZ).date().isoformat()
@@ -244,56 +245,15 @@ async def process_daily_check_reminders(bot):
         check_date = reminder["check_date"]
         stage = reminder["reminder_stage"]
 
-        # Стадия 3 — уведомление супервайзеру.
+        # Стадия 3 — пропускаем уведомление супервайзеру.
         if stage == 3:
-            if reminder["escalation_sent_at"] is None:
-                group_id = reminder["group_chat_id"]
-
-                if group_id is None:
-                    logging.warning(
-                        "У магазина %s нет группы супервайзера",
-                        reminder["code"]
-                    )
-                else:
-                    try:
-                        await bot.send_message(
-                            chat_id=group_id,
-                            text=(
-                                "⚠️ МАГАЗИН НЕ ОТВЕТИЛ НА УТРЕННИЙ ОПРОС!\n\n"
-                                f"Магазин: {reminder['code']}\n"
-                                f"Адрес: {reminder['address']}\n\n"
-                                "Магазин не подтвердил состояние "
-                                "электроснабжения после трёх напоминаний."
-                            )
-                        )
-
-                        await mark_daily_check_escalation_sent(
-                            shop_id,
-                            check_date
-                        )
-
-                        logging.info(
-                            "Супервайзер уведомлён: магазин %s",
-                            reminder["code"]
-                        )
-
-                    except Exception:
-                        logging.exception(
-                            "Не удалось уведомить супервайзера магазина %s",
-                            reminder["code"]
-                        )
-                        continue
-
-            # После уведомления переходим к часовым напоминаниям.
-            advanced = await advance_daily_check_reminder(
+            await advance_daily_check_reminder(
                 shop_id,
                 check_date,
                 stage
             )
-
             continue
 
-        # Остальные стадии — сообщения непосредственно магазину.
         if stage == 0:
             message_text = (
                 "⚠️ НАПОМИНАНИЕ!\n\n"
@@ -313,7 +273,7 @@ async def process_daily_check_reminders(bot):
             message_text = (
                 "🚨 ПОСЛЕДНЕЕ НАПОМИНАНИЕ!\n\n"
                 "Вы не ответили на утренний опрос.\n"
-                "В 10:15 информация будет передана супервайзеру."
+                "Пожалуйста, ответьте сейчас!"
             )
 
         else:
@@ -357,6 +317,7 @@ async def process_daily_check_reminders(bot):
                 "Не удалось отправить напоминание магазину %s",
                 reminder["code"]
             )
+
 
 async def send_daily_summary(bot, check_date: str):
     """Отправляет утреннюю сводку отдельно в группу каждого супервайзера."""
