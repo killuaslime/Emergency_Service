@@ -14,9 +14,10 @@ DB_PATH = Path(__file__).resolve().parent.parent / "electricity.db"
 
 async def init_db():
     logging.debug("Путь к базе данных: %s", DB_PATH.resolve())
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("PRAGMA foreign_keys = ON")
-
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=30000")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS shops (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -225,7 +226,7 @@ async def init_db():
 
 
 async def get_user(max_user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -246,7 +247,7 @@ async def get_user(max_user_id: int):
 
 
 async def get_shop_by_code(code: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -259,7 +260,7 @@ async def get_shop_by_code(code: str):
 
 
 async def save_panel(shop_id: int, chat_id: int, message_id: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE shops
             SET panel_chat_id = ?,
@@ -271,7 +272,7 @@ async def save_panel(shop_id: int, chat_id: int, message_id: str):
 
 
 async def get_shop_status(shop_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("""
             SELECT id
             FROM outages
@@ -282,16 +283,18 @@ async def get_shop_status(shop_id: int) -> bool:
         return await cursor.fetchone() is not None
 
 
+
 async def switch_power(
     shop_id: int,
     action: str,
     started_at_override: str | None = None,
-    ended_at_override: str | None = None
+    ended_at_override: str | None = None,
+    send_notification: bool = True
 ) -> dict:
     now = datetime.now(MOSCOW_TZ)
     now_iso = now.isoformat(timespec="seconds")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("BEGIN IMMEDIATE")
 
         try:
@@ -311,7 +314,7 @@ async def switch_power(
 
                 started_at = started_at_override or now_iso
 
-                due_at = now_iso
+                due_at = now_iso if send_notification else None
 
                 cursor = await db.execute("""
                     INSERT INTO outages (
@@ -350,8 +353,6 @@ async def switch_power(
 
                 duration_text = f"{hours} ч. {minutes} мин."
 
-                # Если отключение длилось меньше минуты,
-                # отменяем ожидающее уведомление.
                 if total_seconds < 60:
                     await db.execute("""
                         UPDATE outages
@@ -382,6 +383,79 @@ async def switch_power(
             await db.rollback()
             raise
 
+
+async def start_morning_outage(
+    shop_id: int,
+    morning_time: str
+) -> dict:
+    """
+    Закрывает предыдущее отключение в 08:15
+    и создаёт новое отключение с 08:15.
+    Не отправляет уведомления ни о закрытии, ни о создании.
+    """
+
+    now_iso = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+        await db.execute("BEGIN IMMEDIATE")
+
+        try:
+            cursor = await db.execute("""
+                SELECT id
+                FROM outages
+                WHERE shop_id = ?
+                  AND ended_at IS NULL
+                ORDER BY started_at DESC
+                LIMIT 1
+            """, (shop_id,))
+
+            old_outage = await cursor.fetchone()
+
+            old_outage_id = None
+
+            if old_outage:
+                old_outage_id = old_outage[0]
+
+                # Закрываем старое отключение.
+                # Убираем ожидающее уведомление о его начале
+                # и подавляем уведомление о восстановлении.
+                await db.execute("""
+                    UPDATE outages
+                    SET ended_at = ?,
+                        notification_due_at = NULL,
+                        restoration_sent_at = ?
+                    WHERE id = ?
+                """, (
+                    morning_time,
+                    now_iso,
+                    old_outage_id
+                ))
+
+            # Создаём новое отключение с 08:15
+            # без постановки уведомления в очередь.
+            cursor = await db.execute("""
+                INSERT INTO outages (
+                    shop_id,
+                    started_at,
+                    notification_due_at
+                )
+                VALUES (?, ?, NULL)
+            """, (shop_id, morning_time))
+
+            new_outage_id = cursor.lastrowid
+
+            await db.commit()
+
+            return {
+                "status": "off",
+                "old_outage_id": old_outage_id,
+                "new_outage_id": new_outage_id
+            }
+
+        except Exception:
+            await db.rollback()
+            raise
+
 async def register_or_create_request(
     max_user_id: int,
     shop_code: str,
@@ -389,7 +463,7 @@ async def register_or_create_request(
     supervisor_id: int | None
 ) -> str:
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.execute("BEGIN IMMEDIATE")
 
@@ -488,7 +562,7 @@ async def register_or_create_request(
             raise
 
 async def get_latest_outage(shop_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -502,7 +576,7 @@ async def get_latest_outage(shop_id: int):
         return await cursor.fetchone()
 
 async def get_supervisor_shops(supervisor_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -554,7 +628,7 @@ async def get_supervisor_history(
 ):
     """Последние отключения магазинов супервайзера."""
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -585,7 +659,7 @@ async def get_supervisor_history(
 
 
 async def get_daily_check_shops():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -609,7 +683,7 @@ async def create_daily_check(shop_id: int, check_date: str):
     Возвращает None только если сообщение уже доставлено. Благодаря этому
     повторный запуск планировщика подхватывает незавершённые отправки.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("""
             INSERT OR IGNORE INTO daily_checks (
                 shop_id, check_date, sent_at
@@ -644,7 +718,7 @@ async def claim_daily_check_delivery(
     """Атомарно захватывает попытку отправки; защищает от частых повторов."""
     now = datetime.now(MOSCOW_TZ)
     now_iso = now.isoformat(timespec="seconds")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
             cursor = await db.execute("""
@@ -668,7 +742,7 @@ async def claim_daily_check_delivery(
 
 
 async def mark_daily_check_delivery_failed(check_id: int, error: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE daily_checks
             SET delivery_error = ?
@@ -682,7 +756,7 @@ async def save_daily_check_message(
     chat_id: int,
     message_id: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE daily_checks
             SET message_chat_id = ?,
@@ -695,7 +769,7 @@ async def save_daily_check_message(
 
 
 async def get_daily_check(check_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -717,7 +791,7 @@ async def answer_daily_check(
     if status not in ("on", "off"):
         return False
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("BEGIN IMMEDIATE")
 
         try:
@@ -743,7 +817,7 @@ async def answer_daily_check(
             raise
 
 async def delete_daily_check(check_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute(
             "DELETE FROM daily_checks WHERE id = ?",
             (check_id,)
@@ -756,7 +830,7 @@ async def sync_shops_from_json():
     with open(shops_path, "r", encoding="utf-8") as file:
         shops = json.load(file)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         for shop in shops:
             await db.execute("""
                 INSERT INTO shops (
@@ -779,7 +853,7 @@ async def sync_shops_from_json():
     logging.info("Синхронизировано магазинов: %s", len(shops))
 
 async def get_daily_check_results(check_date: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -800,7 +874,7 @@ async def get_daily_check_results(check_date: str):
 
 
 async def mark_daily_checks_summary_sent(check_date: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE daily_checks
             SET summary_sent_at = ?
@@ -815,7 +889,7 @@ async def mark_daily_checks_summary_sent(check_date: str):
 
 
 async def has_pending_daily_summary(check_date: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("""
             SELECT 1
             FROM daily_checks
@@ -832,7 +906,7 @@ async def get_closing_summary_shops(summary_date: str):
     Открытое отключение имеет приоритет. Если отключения нет, учитываем
     утренний ответ: отсутствие ответа считается unknown.
     """
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
             SELECT
@@ -872,7 +946,7 @@ async def has_daily_summary_been_sent(
     summary_date: str,
     summary_type: str
 ) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("""
             SELECT 1
             FROM daily_summary_log
@@ -888,7 +962,7 @@ async def mark_daily_summary_as_sent(
     summary_date: str,
     summary_type: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             INSERT OR IGNORE INTO daily_summary_log (
                 summary_date,
@@ -906,7 +980,7 @@ async def mark_daily_summary_as_sent(
 
 
 async def get_daily_summary_job(summary_date: str, summary_type: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("""
             SELECT payload, sent_at
@@ -921,7 +995,7 @@ async def save_daily_summary_job(
     summary_type: str,
     payload: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             INSERT OR IGNORE INTO daily_summary_jobs (
                 summary_date, summary_type, payload, created_at
@@ -942,7 +1016,7 @@ async def claim_daily_summary_job(
 ) -> bool:
     """Атомарно захватывает отправку отчёта для защиты от параллельных дублей."""
     now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("BEGIN IMMEDIATE")
         try:
             cursor = await db.execute("""
@@ -967,7 +1041,7 @@ async def claim_daily_summary_job(
 
 async def mark_daily_summary_job_sent(summary_date: str, summary_type: str):
     now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE daily_summary_jobs
             SET sent_at = COALESCE(sent_at, ?)
@@ -987,7 +1061,7 @@ async def get_supervisor_daily_check_results(
 ):
     """Утренние ответы только по магазинам конкретного супервайзера."""
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -1011,7 +1085,7 @@ async def save_supervisor_daily_report(
     check_date: str,
     message_id: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             INSERT OR REPLACE INTO supervisor_daily_reports (
                 supervisor_id,
@@ -1028,7 +1102,7 @@ async def get_supervisor_daily_report(
     supervisor_id: int,
     check_date: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("""
             SELECT message_id
             FROM supervisor_daily_reports
@@ -1044,7 +1118,7 @@ async def clear_supervisor_daily_report(
     supervisor_id: int,
     check_date: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             DELETE FROM supervisor_daily_reports
             WHERE supervisor_id = ?
@@ -1059,7 +1133,7 @@ async def get_pending_group_notifications():
 
     now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -1095,7 +1169,7 @@ async def get_pending_group_notifications():
 
 
 async def mark_outage_notification_sent(outage_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE outages
             SET notification_sent_at = ?
@@ -1109,7 +1183,7 @@ async def mark_outage_notification_sent(outage_id: int):
 
 
 async def mark_restoration_notification_sent(outage_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE outages
             SET restoration_sent_at = ?
@@ -1130,7 +1204,7 @@ async def sync_supervisors_from_json():
     with open(path, "r", encoding="utf-8") as file:
         supervisors = json.load(file)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         for supervisor in supervisors:
             await db.execute("""
                 INSERT INTO supervisors (
@@ -1154,7 +1228,7 @@ async def sync_supervisors_from_json():
         await db.commit()
 
 async def get_supervisor_group(supervisor_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -1167,7 +1241,7 @@ async def get_supervisor_group(supervisor_id: int):
         return await cursor.fetchone()
 
 async def get_shop_group(shop_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -1187,7 +1261,7 @@ async def update_daily_summary_job_payload(
     summary_type: str,
     payload: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute(
             """
             UPDATE daily_summary_jobs
@@ -1206,7 +1280,7 @@ async def create_sign_check(shop_id: int, check_date: str, check_type: str):
     if check_type not in ("on", "off"):
         raise ValueError("Некорректный тип опроса вывески")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             INSERT OR IGNORE INTO sign_checks (
                 shop_id, check_date, check_type
@@ -1236,7 +1310,7 @@ async def save_sign_check_message(
     chat_id: int,
     message_id: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE sign_checks
             SET message_chat_id = ?,
@@ -1252,7 +1326,7 @@ async def answer_sign_check(
     check_id: int,
     shop_id: int
 ) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         cursor = await db.execute("""
             UPDATE sign_checks
             SET answered_at = ?
@@ -1270,7 +1344,7 @@ async def answer_sign_check(
 
 
 async def get_sign_check(check_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -1289,7 +1363,7 @@ async def get_sign_check(check_id: int):
 async def prepare_daily_check_reminders(check_date: str):
     """Создаёт состояние напоминаний для доставленных опросов."""
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             INSERT OR IGNORE INTO daily_check_reminders (
                 shop_id,
@@ -1322,7 +1396,7 @@ async def get_due_daily_check_reminders():
 
     now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
@@ -1382,7 +1456,7 @@ async def advance_daily_check_reminder(
     if target <= now:
         target = now + timedelta(minutes=5)
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("BEGIN IMMEDIATE")
 
         try:
@@ -1422,7 +1496,7 @@ async def mark_daily_check_escalation_sent(
     shop_id: int,
     check_date: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE daily_check_reminders
             SET escalation_sent_at = ?,
@@ -1442,7 +1516,7 @@ async def mark_daily_check_escalation_sent(
 async def stop_daily_check_reminders(shop_id: int, check_date: str):
     """Останавливает напоминания после ответа магазина."""
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE daily_check_reminders
             SET next_reminder_at = NULL,
@@ -1470,7 +1544,7 @@ async def claim_sign_check_delivery(
 
     now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
 
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("BEGIN IMMEDIATE")
 
         try:
@@ -1500,7 +1574,7 @@ async def mark_sign_check_delivery_failed(
     check_id: int,
     error: str
 ):
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         await db.execute("""
             UPDATE sign_checks
             SET delivery_error = ?

@@ -79,7 +79,7 @@ async def get_daily_stats_text(supervisor_id: int, check_date: str):
     for shop in results:
         if shop["status"] == "off":
             lines.append(
-                f"❌ №{shop['code']}\n"
+                f"🔴 №{shop['code']}\n"
                 f"{shop['address']}\n"
                 "Открылся без ЭЭ в 08:15"
             )

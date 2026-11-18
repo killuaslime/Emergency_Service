@@ -33,6 +33,8 @@ from database.database import (
     claim_daily_summary_job,
     mark_daily_summary_job_sent,
     update_daily_summary_job_payload,
+    start_morning_outage,
+    get_shop_group,
         # Опросы вывесок
     get_sign_check_shops,
     create_sign_check,
@@ -390,8 +392,9 @@ async def send_daily_summary(bot, check_date: str):
 
 
 
+
 def build_closing_summary(shops) -> str:
-    """Формирует согласованный вечерний отчёт; unknown никогда не маскируется под on."""
+    """Формирует вечерний отчёт, исключая магазины без подтверждённого статуса."""
     if not shops:
         return "Вечерний отчёт\n\nНет зарегистрированных магазинов для отчёта"
 
@@ -399,11 +402,18 @@ def build_closing_summary(shops) -> str:
         return "Вечерний отчёт\n\n🟢 Все магазины закрылись со светом"
 
     messages = []
+
     for shop in shops:
         if shop["status"] == "off":
             messages.append(
                 f"❌ №{shop['code']}\n{shop['address']}\nЗакрыт без ЭЭ"
             )
+
+        elif shop["status"] == "unknown":
+            continue
+
+    if not messages:
+        return "Вечерний отчёт\n\nНет магазинов, закрывшихся без ЭЭ"
 
     return "Вечерний отчёт\n\n" + "\n\n".join(messages)
 
@@ -561,23 +571,27 @@ async def send_closing_summary(bot, summary_date):
         )
 
 
+
 async def daily_check_scheduler(bot):
     """
-    Расписание:
+    Расписание (Europe/Moscow):
     08:15 — утренний опрос электричества.
     08:30 — опрос включения вывески.
-    09:15 — начало напоминаний.
-    09:30 — второе напоминание.
-    10:00 — последнее напоминание.
-    10:15 — уведомление супервайзеру.
-    Далее — повторные напоминания каждый час.
+    09:15 и далее — напоминания каждые 30 секунд проверяются планировщиком.
     22:00 — опрос выключения вывески.
     22:10 — вечерний отчёт.
 
-    Проверка выполняется раз в 30 секунд.
+    Каждый вид отправки запускается один раз за календарный день.
     """
 
     logging.info("Планировщик запущен (Europe/Moscow)")
+
+    completed = {
+        "daily": None,
+        "sign_on": None,
+        "sign_off": None,
+        "summary": None,
+    }
 
     while True:
         try:
@@ -585,22 +599,29 @@ async def daily_check_scheduler(bot):
             today = now.date().isoformat()
 
             # 08:15 — утренний опрос электричества.
-            if now.hour > 8 or (now.hour == 8 and now.minute >= 15):
+            if (
+                now.hour > 8 or (now.hour == 8 and now.minute >= 15)
+            ) and completed["daily"] != today:
+                completed["daily"] = today
                 await send_daily_checks(bot, today)
 
             # 08:30 — включение вывески.
-            if now.hour > 8 or (now.hour == 8 and now.minute >= 30):
+            if (
+                now.hour > 8 or (now.hour == 8 and now.minute >= 30)
+            ) and completed["sign_on"] != today:
+                completed["sign_on"] = today
                 await send_sign_checks(
                     bot,
                     check_type="on",
                     check_date=today
                 )
 
-            # Напоминания по утреннему опросу.
+            # Напоминания проверяются постоянно.
             await process_daily_check_reminders(bot)
 
             # 22:00 — выключение вывески.
-            if now.hour >= 22:
+            if now.hour >= 22 and completed["sign_off"] != today:
+                completed["sign_off"] = today
                 await send_sign_checks(
                     bot,
                     check_type="off",
@@ -608,9 +629,10 @@ async def daily_check_scheduler(bot):
                 )
 
             # 22:10 — вечерний отчёт.
-            if now.hour > 22 or (
-                now.hour == 22 and now.minute >= 10
-            ):
+            if (
+                now.hour > 22 or (now.hour == 22 and now.minute >= 10)
+            ) and completed["summary"] != today:
+                completed["summary"] = today
                 await send_closing_summary(bot, today)
 
             await asyncio.sleep(30)
@@ -622,10 +644,6 @@ async def daily_check_scheduler(bot):
         except Exception:
             logging.exception("Ошибка планировщика")
             await asyncio.sleep(5)
-
-@router.message_callback(
-    F.callback.payload.startswith("daily_check:")
-)
 
 async def daily_check_callback(event: MessageCallback):
     try:
@@ -680,26 +698,43 @@ async def daily_check_callback(event: MessageCallback):
             f"{check['check_date']}T08:15:00+03:00"
         ).isoformat(timespec="seconds")
 
+
         try:
             if status == "off":
-                # Если отключение уже существует,
-                # switch_power оставит его открытым.
-                result = await switch_power(
+                # Закрываем предыдущее отключение и создаём новое с 08:15.
+                result = await start_morning_outage(
                     shop_id=db_user["shop_id"],
-                    action="power_off",
-                    started_at_override=morning_time
+                    morning_time=morning_time
                 )
 
+                emoji = "🔴"
+                message = "Открылся без ЭЭ в 8:15"
+
             else:
-                # Если есть старое незакрытое отключение,
-                # закрываем его временем 08:15.
+                # Закрываем активное отключение, если оно есть.
                 result = await switch_power(
                     shop_id=db_user["shop_id"],
                     action="power_on",
                     ended_at_override=morning_time
                 )
 
-            # Обновляем панель магазина
+                emoji = "🟢"
+                message = "Открылся с ЭЭ в 8:15"
+
+            # Отправляем сообщение в группу супервайзера.
+            group = await get_shop_group(db_user["shop_id"])
+
+            if group is not None:
+                await event.bot.send_message(
+                    chat_id=group["group_chat_id"],
+                    text=(
+                        f"{emoji}\n\n"
+                        f"№{db_user['code']} {db_user['address']}\n\n"
+                        f"{message}"
+                    )
+                )
+
+            # Обновляем панель магазина.
             await refresh_shop_panel(
                 event.bot,
                 db_user
@@ -714,9 +749,10 @@ async def daily_check_callback(event: MessageCallback):
 
         except Exception:
             logging.exception(
-                "Не удалось обновить состояние электричества магазина %s",
+                "Не удалось обработать утренний ответ магазина %s",
                 db_user["code"]
             )
+
         # Автоматически обновляем статистику супервайзера
         if db_user["supervisor_id"] is not None:
             await refresh_supervisor_daily_report(
