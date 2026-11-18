@@ -188,15 +188,6 @@ async def power_callback(event: MessageCallback):
 
         keyboard = create_keyboard(is_off)
 
-        # print("\n========== PANEL DEBUG ==========")
-        # print("ACTION:", action)
-        # print("RESULT:", result)
-        # print("OUTAGE:", dict(outage) if outage else None)
-        # print("IS_OFF:", is_off)
-        # print("MESSAGE ID:", event.message.body.mid)
-        # print("KEYBOARD TYPE:", type(keyboard))
-        # print("KEYBOARD:", repr(keyboard))
-
         edited = await event.bot.edit_message(
             message_id=event.message.body.mid,
             text=get_panel_text(db_user, outage),

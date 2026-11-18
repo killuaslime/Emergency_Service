@@ -33,6 +33,22 @@ from database.database import (
     claim_daily_summary_job,
     mark_daily_summary_job_sent,
     update_daily_summary_job_payload,
+        # Опросы вывесок
+    get_sign_check_shops,
+    create_sign_check,
+    claim_sign_check_delivery,
+    mark_sign_check_delivery_failed,
+    save_sign_check_message,
+    get_sign_check,
+    answer_sign_check,
+
+    # Напоминания по утреннему опросу
+    prepare_daily_check_reminders,
+    get_due_daily_check_reminders,
+    advance_daily_check_reminder,
+    stop_daily_check_reminders,
+    mark_daily_check_escalation_sent,
+    
 )
 
 router = Router()
@@ -51,7 +67,90 @@ def daily_keyboard(check_id: int):
     ))
     return builder.as_markup()
 
+def sign_keyboard(check_id: int, check_type: str):
+    builder = InlineKeyboardBuilder()
 
+    if check_type == "on":
+        builder.row(CallbackButton(
+            text="✅ Включили",
+            payload=f"sign_check:on:{check_id}"
+        ))
+    else:
+        builder.row(CallbackButton(
+            text="❌ Выключили",
+            payload=f"sign_check:off:{check_id}"
+        ))
+
+    return builder.as_markup()
+
+
+async def send_sign_checks(bot, check_type: str, check_date: str | None = None):
+    check_date = check_date or datetime.now(MOSCOW_TZ).date().isoformat()
+
+    shops = await get_sign_check_shops()
+
+    question = (
+        "💡 ВКЛЮЧИТЕ ВЫВЕСКУ!"
+        if check_type == "on"
+        else "🌙 ВЫКЛЮЧИТЕ ВЫВЕСКУ!"
+    )
+
+    logging.info(
+        "Отправляем опрос вывесок: type=%s, shops=%s",
+        check_type,
+        len(shops)
+    )
+
+    for shop in shops:
+        check_id = await create_sign_check(
+            shop_id=shop["id"],
+            check_date=check_date,
+            check_type=check_type
+        )
+
+        if check_id is None:
+            continue
+
+        claimed = await claim_sign_check_delivery(check_id)
+
+        if not claimed:
+            continue
+
+        try:
+            sent = await bot.send_message(
+                chat_id=shop["panel_chat_id"],
+                text=(
+                    f"{question}\n\n"
+                    f"Магазин: {shop['code']}\n"
+                    f"Адрес: {shop['address']}"
+                ),
+                attachments=[sign_keyboard(check_id, check_type)]
+            )
+
+            if sent is None or sent.message is None or sent.message.body is None:
+                raise RuntimeError("MAX не вернул отправленное сообщение")
+
+            await save_sign_check_message(
+                check_id=check_id,
+                chat_id=shop["panel_chat_id"],
+                message_id=sent.message.body.mid
+            )
+
+            logging.info(
+                "Опрос вывески отправлен магазину %s",
+                shop["code"]
+            )
+
+        except Exception as exc:
+            await mark_sign_check_delivery_failed(
+                check_id,
+                repr(exc)
+            )
+
+            logging.exception(
+                "Ошибка отправки опроса вывески магазину %s",
+                shop["code"]
+            )
 async def send_daily_checks(bot, check_date: str | None = None):
     """Создаёт/доставляет опросы за дату; незавершённые отправки повторяются."""
     check_date = check_date or datetime.now(MOSCOW_TZ).date().isoformat()
@@ -95,6 +194,167 @@ async def send_daily_checks(bot, check_date: str | None = None):
             await mark_daily_check_delivery_failed(check_id, repr(exc))
             logging.exception("Не удалось отправить опрос магазину %s", shop["code"])
 
+# Сообщения-напоминания удаляются через 5 секунд.
+_temporary_message_tasks = set()
+
+
+async def delete_message_after_delay(bot, message_id, delay=5):
+    await asyncio.sleep(delay)
+
+    try:
+        await bot.delete_message(message_id=message_id)
+    except Exception:
+        logging.exception(
+            "Не удалось удалить временное сообщение напоминания"
+        )
+
+
+def schedule_message_deletion(bot, message_id):
+    task = asyncio.create_task(
+        delete_message_after_delay(bot, message_id)
+    )
+
+    _temporary_message_tasks.add(task)
+    task.add_done_callback(_temporary_message_tasks.discard)
+
+
+async def process_daily_check_reminders(bot):
+    """
+    Обрабатывает напоминания по опросу 08:15.
+
+    Стадии:
+    0 — 09:15, первое напоминание.
+    1 — 09:30, второе напоминание.
+    2 — 10:00, последнее напоминание магазину.
+    3 — 10:15, уведомление супервайзеру.
+    4+ — повторные напоминания каждый час.
+    """
+
+    today = datetime.now(MOSCOW_TZ).date().isoformat()
+
+    # Создаём записи для всех доставленных опросов без ответа.
+    await prepare_daily_check_reminders(today)
+
+    reminders = await get_due_daily_check_reminders()
+
+    for reminder in reminders:
+        shop_id = reminder["shop_id"]
+        check_date = reminder["check_date"]
+        stage = reminder["reminder_stage"]
+
+        # Стадия 3 — уведомление супервайзеру.
+        if stage == 3:
+            if reminder["escalation_sent_at"] is None:
+                group_id = reminder["group_chat_id"]
+
+                if group_id is None:
+                    logging.warning(
+                        "У магазина %s нет группы супервайзера",
+                        reminder["code"]
+                    )
+                else:
+                    try:
+                        await bot.send_message(
+                            chat_id=group_id,
+                            text=(
+                                "⚠️ МАГАЗИН НЕ ОТВЕТИЛ НА УТРЕННИЙ ОПРОС!\n\n"
+                                f"Магазин: {reminder['code']}\n"
+                                f"Адрес: {reminder['address']}\n\n"
+                                "Магазин не подтвердил состояние "
+                                "электроснабжения после трёх напоминаний."
+                            )
+                        )
+
+                        await mark_daily_check_escalation_sent(
+                            shop_id,
+                            check_date
+                        )
+
+                        logging.info(
+                            "Супервайзер уведомлён: магазин %s",
+                            reminder["code"]
+                        )
+
+                    except Exception:
+                        logging.exception(
+                            "Не удалось уведомить супервайзера магазина %s",
+                            reminder["code"]
+                        )
+                        continue
+
+            # После уведомления переходим к часовым напоминаниям.
+            advanced = await advance_daily_check_reminder(
+                shop_id,
+                check_date,
+                stage
+            )
+
+            continue
+
+        # Остальные стадии — сообщения непосредственно магазину.
+        if stage == 0:
+            message_text = (
+                "⚠️ НАПОМИНАНИЕ!\n\n"
+                "Вы ещё не ответили на утренний опрос "
+                "о состоянии электроснабжения.\n"
+                "Пожалуйста, пройдите опрос!"
+            )
+
+        elif stage == 1:
+            message_text = (
+                "⚠️ ВТОРОЕ НАПОМИНАНИЕ!\n\n"
+                "Мы всё ещё не получили ваш ответ на утренний опрос.\n"
+                "Пожалуйста, ответьте сейчас!"
+            )
+
+        elif stage == 2:
+            message_text = (
+                "🚨 ПОСЛЕДНЕЕ НАПОМИНАНИЕ!\n\n"
+                "Вы не ответили на утренний опрос.\n"
+                "В 10:15 информация будет передана супервайзеру."
+            )
+
+        else:
+            message_text = (
+                "⚠️ ВЫ НЕ ПРОШЛИ УТРЕННИЙ ОПРОС!\n\n"
+                "Пожалуйста, сообщите состояние электроснабжения "
+                "нажатием кнопки в утреннем опросе."
+            )
+
+        try:
+            sent = await bot.send_message(
+                chat_id=reminder["panel_chat_id"],
+                text=message_text
+            )
+
+            if (
+                sent is not None
+                and sent.message is not None
+                and sent.message.body is not None
+            ):
+                schedule_message_deletion(
+                    bot,
+                    sent.message.body.mid
+                )
+
+            advanced = await advance_daily_check_reminder(
+                shop_id,
+                check_date,
+                stage
+            )
+
+            if advanced:
+                logging.info(
+                    "Отправлено напоминание магазину %s, стадия %s",
+                    reminder["code"],
+                    stage
+                )
+
+        except Exception:
+            logging.exception(
+                "Не удалось отправить напоминание магазину %s",
+                reminder["code"]
+            )
 
 async def send_daily_summary(bot, check_date: str):
     """Отправляет утреннюю сводку отдельно в группу каждого супервайзера."""
@@ -303,91 +563,57 @@ async def send_closing_summary(bot, summary_date):
 
 async def daily_check_scheduler(bot):
     """
-    08:15 — утренние опросы.
+    Расписание:
+    08:15 — утренний опрос электричества.
+    08:30 — опрос включения вывески.
+    09:15 — начало напоминаний.
+    09:30 — второе напоминание.
+    10:00 — последнее напоминание.
+    10:15 — уведомление супервайзеру.
+    Далее — повторные напоминания каждый час.
+    22:00 — опрос выключения вывески.
     22:10 — вечерний отчёт.
 
-    Без постоянного опроса каждые 30 секунд.
-    Поддерживает восстановление после перезапуска.
+    Проверка выполняется раз в 30 секунд.
     """
 
     logging.info("Планировщик запущен (Europe/Moscow)")
-
-    last_morning_date = None
-    last_closing_date = None
 
     while True:
         try:
             now = datetime.now(MOSCOW_TZ)
             today = now.date().isoformat()
 
-            poll_time = now.replace(
-                hour=8, minute=15, second=0, microsecond=0
-            )
-
-            closing_time = now.replace(
-                hour=22, minute=10, second=0, microsecond=0
-            )
-
-            # Утренний опрос
-            if now >= poll_time and last_morning_date != today:
-                logging.info("Запуск утренних опросов за %s", today)
-
+            # 08:15 — утренний опрос электричества.
+            if now.hour > 8 or (now.hour == 8 and now.minute >= 15):
                 await send_daily_checks(bot, today)
-                last_morning_date = today
 
-            # Вечерний отчёт
-            if now >= closing_time and last_closing_date != today:
-                logging.info("Запуск вечернего отчёта за %s", today)
-
-                await send_closing_summary(bot, today)
-
-                if await has_daily_summary_been_sent(today, "closing"):
-                    last_closing_date = today
-                    logging.info("Вечерний отчёт успешно доставлен")
-                else:
-                    logging.warning(
-                        "Отчёт доставлен не полностью. "
-                        "Следующая попытка через 10 минут"
-                    )
-
-            # Определяем следующее событие
-            now = datetime.now(MOSCOW_TZ)
-            today = now.date().isoformat()
-
-            poll_time = now.replace(
-                hour=8, minute=15, second=0, microsecond=0
-            )
-
-            closing_time = now.replace(
-                hour=22, minute=10, second=0, microsecond=0
-            )
-
-            if last_morning_date != today and now < poll_time:
-                next_run = poll_time
-
-            elif last_closing_date != today and now < closing_time:
-                next_run = closing_time
-
-            elif last_closing_date != today and now >= closing_time:
-                # Повторная доставка неуспешного вечернего отчёта
-                next_run = now + timedelta(minutes=10)
-
-            else:
-                # Следующий день, 08:15
-                next_run = (now + timedelta(days=1)).replace(
-                    hour=8, minute=15, second=0, microsecond=0
+            # 08:30 — включение вывески.
+            if now.hour > 8 or (now.hour == 8 and now.minute >= 30):
+                await send_sign_checks(
+                    bot,
+                    check_type="on",
+                    check_date=today
                 )
 
-            sleep_seconds = max(
-                1, (next_run - now).total_seconds()
-            )
+            # Напоминания по утреннему опросу.
+            await process_daily_check_reminders(bot)
 
-            logging.info(
-                "Следующая задача: %s",
-                next_run.strftime("%d.%m.%Y %H:%M:%S")
-            )
+            # 22:00 — выключение вывески.
+            if now.hour >= 22:
+                await send_sign_checks(
+                    bot,
+                    check_type="off",
+                    check_date=today
+                )
 
-            await asyncio.sleep(sleep_seconds)
+            # 22:10 — вечерний отчёт.
+            if now.hour > 22 or (
+                now.hour == 22 and now.minute >= 10
+            ):
+                await send_closing_summary(bot, today)
+
+            await asyncio.sleep(30)
 
         except asyncio.CancelledError:
             logging.info("Планировщик остановлен")
@@ -396,7 +622,6 @@ async def daily_check_scheduler(bot):
         except Exception:
             logging.exception("Ошибка планировщика")
             await asyncio.sleep(5)
-
 
 @router.message_callback(
     F.callback.payload.startswith("daily_check:")
@@ -447,7 +672,10 @@ async def daily_check_callback(event: MessageCallback):
 
         if not saved:
             return
-
+        await stop_daily_check_reminders(
+            db_user["shop_id"],
+            check["check_date"]
+        )
         morning_time = datetime.fromisoformat(
             f"{check['check_date']}T08:15:00+03:00"
         ).isoformat(timespec="seconds")
@@ -510,3 +738,70 @@ async def daily_check_callback(event: MessageCallback):
         logging.exception(
             "Ошибка обработки утреннего опроса"
         )
+@router.message_callback(
+    F.callback.payload.startswith("sign_check:")
+)
+
+async def sign_check_callback(event: MessageCallback):
+    try:
+        user = await event.fetch_from_user()
+
+        if user is None:
+            return
+
+        db_user = await get_user(user.user_id)
+
+        if db_user is None:
+            return
+
+        if event.message is None or event.message.body is None:
+            return
+
+        parts = event.callback.payload.split(":")
+
+        if len(parts) != 3:
+            return
+
+        _, status, check_id_raw = parts
+
+        if status not in ("on", "off"):
+            return
+
+        check_id = int(check_id_raw)
+
+        check = await get_sign_check(check_id)
+
+        if check is None:
+            return
+
+        if check["shop_id"] != db_user["shop_id"]:
+            return
+        
+        if check["check_type"] != status:
+            return
+        
+        saved = await answer_sign_check(
+            check_id=check_id,
+            shop_id=db_user["shop_id"]
+        )
+
+        if not saved:
+            return
+
+        logging.info(
+            "Магазин %s ответил на опрос вывески: %s",
+            db_user["code"],
+            status
+        )
+
+        try:
+            await event.bot.delete_message(
+                message_id=event.message.body.mid
+            )
+        except Exception:
+            logging.exception(
+                "Не удалось удалить сообщение опроса вывески"
+            )
+
+    except Exception:
+        logging.exception("Ошибка обработки опроса вывески")

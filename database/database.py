@@ -42,7 +42,40 @@ async def init_db():
             await db.execute(
                 "ALTER TABLE shops ADD COLUMN panel_message_id TEXT"
             )
+        # Опросы включения и выключения вывески
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sign_checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                shop_id INTEGER NOT NULL,
+                check_date TEXT NOT NULL,
+                check_type TEXT NOT NULL,
+                answered_at TEXT,
+                message_chat_id INTEGER,
+                message_id TEXT,
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                last_delivery_attempt_at TEXT,
+                delivery_error TEXT,
 
+                FOREIGN KEY (shop_id) REFERENCES shops(id),
+                UNIQUE (shop_id, check_date, check_type)
+            )
+        """)
+
+        # Состояние напоминаний по утреннему опросу
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS daily_check_reminders (
+                shop_id INTEGER NOT NULL,
+                check_date TEXT NOT NULL,
+                reminder_stage INTEGER NOT NULL DEFAULT 0,
+                next_reminder_at TEXT,
+                escalation_sent_at TEXT,
+                last_message_id TEXT,
+                updated_at TEXT NOT NULL,
+
+                PRIMARY KEY (shop_id, check_date),
+                FOREIGN KEY (shop_id) REFERENCES shops(id)
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1164,4 +1197,315 @@ async def update_daily_summary_job_payload(
             """,
             (payload, summary_date, summary_type)
         )
+        await db.commit()
+# ==========================================
+# ОПРОСЫ ВЫВЕСКИ
+# ==========================================
+
+async def create_sign_check(shop_id: int, check_date: str, check_type: str):
+    if check_type not in ("on", "off"):
+        raise ValueError("Некорректный тип опроса вывески")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO sign_checks (
+                shop_id, check_date, check_type
+            )
+            VALUES (?, ?, ?)
+        """, (shop_id, check_date, check_type))
+
+        cursor = await db.execute("""
+            SELECT id, message_id
+            FROM sign_checks
+            WHERE shop_id = ?
+              AND check_date = ?
+              AND check_type = ?
+        """, (shop_id, check_date, check_type))
+
+        row = await cursor.fetchone()
+        await db.commit()
+
+        if row is None or row[1] is not None:
+            return None
+
+        return row[0]
+
+
+async def save_sign_check_message(
+    check_id: int,
+    chat_id: int,
+    message_id: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE sign_checks
+            SET message_chat_id = ?,
+                message_id = ?,
+                delivery_error = NULL
+            WHERE id = ?
+        """, (chat_id, str(message_id), check_id))
+
+        await db.commit()
+
+
+async def answer_sign_check(
+    check_id: int,
+    shop_id: int
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("""
+            UPDATE sign_checks
+            SET answered_at = ?
+            WHERE id = ?
+              AND shop_id = ?
+              AND answered_at IS NULL
+        """, (
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            check_id,
+            shop_id
+        ))
+
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_sign_check(check_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT *
+            FROM sign_checks
+            WHERE id = ?
+        """, (check_id,))
+
+        return await cursor.fetchone()
+
+
+# ==========================================
+# НАПОМИНАНИЯ ПО УТРЕННЕМУ ОПРОСУ
+# ==========================================
+
+async def prepare_daily_check_reminders(check_date: str):
+    """Создаёт состояние напоминаний для доставленных опросов."""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR IGNORE INTO daily_check_reminders (
+                shop_id,
+                check_date,
+                reminder_stage,
+                next_reminder_at,
+                updated_at
+            )
+            SELECT
+                shop_id,
+                check_date,
+                0,
+                ?,
+                ?
+            FROM daily_checks
+            WHERE check_date = ?
+              AND message_id IS NOT NULL
+              AND status IS NULL
+        """, (
+            f"{check_date}T09:15:00+03:00",
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            check_date
+        ))
+
+        await db.commit()
+
+
+async def get_due_daily_check_reminders():
+    """Получает магазины, которым пора отправить напоминание."""
+
+    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        cursor = await db.execute("""
+            SELECT
+                r.shop_id,
+                r.check_date,
+                r.reminder_stage,
+                r.escalation_sent_at,
+                s.code,
+                s.address,
+                s.panel_chat_id,
+                s.supervisor_id,
+                sv.group_chat_id,
+                dc.id AS check_id
+            FROM daily_check_reminders r
+            JOIN daily_checks dc
+                ON dc.shop_id = r.shop_id
+               AND dc.check_date = r.check_date
+            JOIN shops s ON s.id = r.shop_id
+            LEFT JOIN supervisors sv
+                ON sv.max_user_id = s.supervisor_id
+               AND sv.is_active = 1
+            WHERE dc.status IS NULL
+              AND r.next_reminder_at IS NOT NULL
+              AND r.next_reminder_at <= ?
+            ORDER BY r.next_reminder_at
+        """, (now,))
+
+        return await cursor.fetchall()
+
+async def advance_daily_check_reminder(
+    shop_id: int,
+    check_date: str,
+    expected_stage: int
+):
+    """Переводит напоминание на следующую стадию."""
+
+    now = datetime.now(MOSCOW_TZ)
+    now_iso = now.isoformat(timespec="seconds")
+
+    if expected_stage == 0:
+        target = datetime.fromisoformat(
+            f"{check_date}T09:30:00+03:00"
+        )
+    elif expected_stage == 1:
+        target = datetime.fromisoformat(
+            f"{check_date}T10:00:00+03:00"
+        )
+    elif expected_stage == 2:
+        target = datetime.fromisoformat(
+            f"{check_date}T10:15:00+03:00"
+        )
+    else:
+        target = now + timedelta(hours=1)
+
+    # Если планировщик опоздал, не назначаем время в прошлом.
+    if target <= now:
+        target = now + timedelta(minutes=5)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+
+        try:
+            cursor = await db.execute("""
+                UPDATE daily_check_reminders
+                SET reminder_stage = reminder_stage + 1,
+                    next_reminder_at = ?,
+                    updated_at = ?
+                WHERE shop_id = ?
+                  AND check_date = ?
+                  AND reminder_stage = ?
+                  AND EXISTS (
+                      SELECT 1
+                      FROM daily_checks
+                      WHERE daily_checks.shop_id = ?
+                        AND daily_checks.check_date = ?
+                        AND daily_checks.status IS NULL
+                  )
+            """, (
+                target.isoformat(timespec="seconds"),
+                now_iso,
+                shop_id,
+                check_date,
+                expected_stage,
+                shop_id,
+                check_date
+            ))
+
+            await db.commit()
+            return cursor.rowcount == 1
+
+        except Exception:
+            await db.rollback()
+            raise
+
+async def mark_daily_check_escalation_sent(
+    shop_id: int,
+    check_date: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE daily_check_reminders
+            SET escalation_sent_at = ?,
+                updated_at = ?
+            WHERE shop_id = ?
+              AND check_date = ?
+              AND escalation_sent_at IS NULL
+        """, (
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            shop_id,
+            check_date
+        ))
+
+        await db.commit()
+
+async def stop_daily_check_reminders(shop_id: int, check_date: str):
+    """Останавливает напоминания после ответа магазина."""
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE daily_check_reminders
+            SET next_reminder_at = NULL,
+                updated_at = ?
+            WHERE shop_id = ?
+              AND check_date = ?
+        """, (
+            datetime.now(MOSCOW_TZ).isoformat(timespec="seconds"),
+            shop_id,
+            check_date
+        ))
+
+        await db.commit()
+
+async def get_sign_check_shops():
+    """Получает зарегистрированные магазины для опросов вывесок."""
+    return await get_daily_check_shops()
+
+
+async def claim_sign_check_delivery(
+    check_id: int,
+    retry_after_seconds: int = 60
+) -> bool:
+    """Атомарно захватывает попытку отправки опроса вывески."""
+
+    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+
+        try:
+            cursor = await db.execute("""
+                UPDATE sign_checks
+                SET delivery_attempts = delivery_attempts + 1,
+                    last_delivery_attempt_at = ?,
+                    delivery_error = NULL
+                WHERE id = ?
+                  AND message_id IS NULL
+                  AND (
+                    last_delivery_attempt_at IS NULL
+                    OR julianday(?) - julianday(last_delivery_attempt_at)
+                       >= (? / 86400.0)
+                  )
+            """, (now, check_id, now, retry_after_seconds))
+
+            await db.commit()
+            return cursor.rowcount == 1
+
+        except Exception:
+            await db.rollback()
+            raise
+
+
+async def mark_sign_check_delivery_failed(
+    check_id: int,
+    error: str
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            UPDATE sign_checks
+            SET delivery_error = ?
+            WHERE id = ?
+              AND message_id IS NULL
+        """, (str(error)[:1000], check_id))
+
         await db.commit()
