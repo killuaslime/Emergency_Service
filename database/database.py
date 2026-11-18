@@ -278,9 +278,7 @@ async def switch_power(
 
                 started_at = started_at_override or now_iso
 
-                due_at = (
-                    now + timedelta(seconds=60)
-                ).isoformat(timespec="seconds")
+                due_at = now_iso
 
                 cursor = await db.execute("""
                     INSERT INTO outages (
