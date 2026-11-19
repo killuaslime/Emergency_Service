@@ -605,7 +605,10 @@ async def daily_check_scheduler(bot):
         except Exception:
             logging.exception("Ошибка планировщика")
             await asyncio.sleep(5)
-
+            
+@router.message_callback(
+    F.callback.payload.startswith("daily_check:")
+)
 async def daily_check_callback(event: MessageCallback):
     try:
         user = await event.fetch_from_user()
