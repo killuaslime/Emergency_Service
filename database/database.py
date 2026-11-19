@@ -43,8 +43,12 @@ async def init_db():
             await db.execute(
                 "ALTER TABLE shops ADD COLUMN panel_message_id TEXT"
             )
+        for col in ("lat", "lon"):
+            if col not in columns:
+                await db.execute(f"ALTER TABLE shops ADD COLUMN {col} REAL")
         # Опросы включения и выключения вывески
         await db.execute("""
+        
             CREATE TABLE IF NOT EXISTS sign_checks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 shop_id INTEGER NOT NULL,
@@ -828,19 +832,19 @@ async def sync_shops_from_json():
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         for shop in shops:
             await db.execute("""
-                INSERT INTO shops (
-                    code,
-                    address,
-                    supervisor_id
-                )
-                VALUES (?, ?, ?)
+                INSERT INTO shops (code, address, supervisor_id, lat, lon)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(code) DO UPDATE SET
                     address = excluded.address,
-                    supervisor_id = excluded.supervisor_id
+                    supervisor_id = excluded.supervisor_id,
+                    lat = COALESCE(excluded.lat, shops.lat),
+                    lon = COALESCE(excluded.lon, shops.lon)
             """, (
                 shop["code"],
                 shop["address"],
-                shop.get("supervisor_id")
+                shop.get("supervisor_id"),
+                shop.get("lat"),
+                shop.get("lon"),
             ))
 
         await db.commit()

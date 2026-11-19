@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#eef1f4">
+<title>Отключения света</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{color-scheme:light dark;
+  --panel:rgba(255,255,255,.93);--solid:#fff;--ink:#141a22;--mute:#5d6976;--line:#e0e5ea;--chip:#eef1f4;
+  --off:#e03131;--on:#17996a;--unk:#7c8794;--shadow:0 8px 30px rgba(15,25,40,.18)}
+@media(prefers-color-scheme:dark){:root{
+  --panel:rgba(20,25,32,.92);--solid:#171d25;--ink:#eaeef2;--mute:#96a2af;--line:#29313b;--chip:#222a34;
+  --off:#ff5a52;--on:#34c38f;--unk:#8a95a3;--shadow:0 8px 30px rgba(0,0,0,.5)}
+  .leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.88) contrast(.92) saturate(.7)}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--chip);color:var(--ink);
+  font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+#map{position:fixed;inset:0}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+
+.panel{position:fixed;z-index:1100;top:12px;left:12px;bottom:12px;width:372px;display:flex;flex-direction:column;
+  background:var(--panel);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+  border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
+.grip{display:none;width:100%;height:22px;padding:0;border:0;background:none;cursor:pointer}
+.grip::after{content:"";display:block;width:40px;height:4px;margin:9px auto 0;border-radius:2px;background:var(--line)}
+.top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:18px 16px 14px}
+h1{margin:0;font-size:20px;line-height:1.15;font-weight:720;letter-spacing:-.015em}
+.upd{display:flex;align-items:center;gap:7px;margin:5px 0 0;color:var(--mute);font-size:12.5px}
+.live{width:7px;height:7px;border-radius:50%;background:var(--on)}
+.live.err{background:var(--off)}
+.ghost{background:none;border:1px solid var(--line);border-radius:10px;padding:7px 11px;font-size:13px;color:var(--mute);cursor:pointer;white-space:nowrap}
+.ghost:hover{color:var(--ink);border-color:var(--mute)}
+form{margin:0}
+
+.bar{display:flex;gap:3px;height:8px;margin:0 16px}
+.bar i{flex:var(--n,0) 1 0;min-width:0;border-radius:4px;background:var(--c);transition:flex-grow .4s}
+.bar .off{--c:var(--off)}.bar .on{--c:var(--on)}.bar .unknown{--c:var(--unk)}
+
+.filters{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:14px 16px 0}
+.filters button{display:flex;flex-direction:column;align-items:flex-start;gap:2px;padding:8px 9px 7px;text-align:left;
+  font-size:12px;color:var(--mute);background:var(--chip);border:1px solid transparent;border-radius:11px;cursor:pointer}
+.filters b{font-size:21px;line-height:1.05;font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums}
+.filters .f-off b{color:var(--off)}
+.filters button[aria-pressed=true]{background:var(--solid);border-color:var(--ink)}
+
+.tools{display:flex;gap:8px;padding:12px 16px 14px}
+input{flex:1;min-width:0;padding:9px 12px;font-size:14px;background:var(--chip);border:1px solid transparent;border-radius:10px}
+input::placeholder{color:var(--mute)}
+#note{margin:0 16px 12px;padding:9px 11px;border-radius:10px;background:var(--chip);color:var(--mute);font-size:12.5px}
+
+#list{flex:1;overflow:auto;overscroll-behavior:contain;border-top:1px solid var(--line)}
+.shop{display:grid;grid-template-columns:10px 1fr auto;align-items:center;gap:12px;width:100%;padding:12px 16px;
+  text-align:left;background:none;border:0;border-bottom:1px solid var(--line);cursor:pointer}
+.shop:hover{background:var(--chip)}
+.shop.sel{background:var(--chip);box-shadow:inset 3px 0 0 var(--c)}
+.shop .dot{width:10px;height:10px;border-radius:50%;background:var(--c)}
+.shop.unknown .dot{background:none;border:2px solid var(--c)}
+.shop strong{display:block;font-size:14px;font-weight:660}
+.shop small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mute);font-size:12.5px}
+.shop .dur{font-size:13px;font-weight:700;color:var(--c);font-variant-numeric:tabular-nums;white-space:nowrap}
+.empty{margin:0;padding:28px 16px;color:var(--mute);text-align:center;font-size:14px}
+
+.pin{display:block;width:100%;height:100%;position:relative;border-radius:50%;background:var(--c);
+  border:3px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.45)}
+.pin.unknown{background:var(--solid);border-color:var(--c)}
+.pin.off::before,.pin.off::after{content:"";position:absolute;inset:-3px;border:2px solid var(--c);border-radius:50%;
+  animation:ping 2.2s ease-out infinite}
+.pin.off::after{animation-delay:1.1s}
+@keyframes ping{from{transform:scale(1);opacity:.9}to{transform:scale(2.4);opacity:0}}
+@media(prefers-reduced-motion:reduce){.pin.off::before,.pin.off::after{animation:none}.bar i{transition:none}}
+
+.leaflet-popup-content-wrapper{padding:0;border-radius:14px;background:var(--solid);color:var(--ink);box-shadow:var(--shadow)}
+.leaflet-popup-content{margin:0;width:250px!important}
+.leaflet-popup-tip{background:var(--solid)}
+.leaflet-container a.leaflet-popup-close-button{color:var(--mute);top:6px;right:6px}
+.pop{padding:16px 18px 18px;border-top:4px solid var(--c);border-radius:14px 14px 0 0}
+.pop-code{font-size:13px;color:var(--mute)}
+.pop-addr{margin:3px 0 12px;font-size:15px;font-weight:620;line-height:1.3}
+.pop-st{display:flex;flex-direction:column;gap:2px}
+.pop-lbl{font-size:13px;font-weight:650;color:var(--c)}
+.pop-big{font-size:30px;line-height:1.1;font-weight:760;letter-spacing:-.02em;color:var(--c);font-variant-numeric:tabular-nums}
+.pop-st small{color:var(--mute);font-size:12.5px}
+.leaflet-control-zoom{border:0!important;box-shadow:var(--shadow)!important}
+.leaflet-control-zoom a{background:var(--solid)!important;color:var(--ink)!important;border-color:var(--line)!important}
+.leaflet-control-attribution{background:var(--panel)!important;color:var(--mute)!important;font-size:10px}
+.leaflet-control-attribution a{color:var(--mute)!important}
+
+@media(max-width:760px){
+  .panel{top:auto;left:8px;right:8px;bottom:calc(24px + env(safe-area-inset-bottom,0px));width:auto;height:42vh;
+    border-radius:18px;transition:height .25s}
+  .panel.tall{height:76vh}
+  .grip{display:block}
+  .top{padding:4px 14px 10px}
+  h1{font-size:18px}
+  .bar{margin:0 14px}
+  .filters{padding:12px 14px 0}.tools{padding:10px 14px 12px}
+  .shop{padding:11px 14px}
+  .leaflet-control-zoom{display:none}
+}
+@media(prefers-reduced-motion:reduce){.panel{transition:none}}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<aside class="panel" id="panel">
+  <button class="grip" id="grip" type="button" aria-label="Развернуть или свернуть список"></button>
+
+  <header class="top">
+    <div>
+      <h1>Отключения света</h1>
+      <p class="upd"><i class="live" id="live"></i><span id="updated">Загрузка…</span></p>
+    </div>
+    <form method="post" action="/logout"><button class="ghost" type="submit">Выйти</button></form>
+  </header>
+
+  <div class="bar" id="bar" aria-hidden="true">
+    <i class="off" hidden></i><i class="unknown" hidden></i><i class="on" hidden></i>
+  </div>
+
+  <div class="filters" id="filters" role="group" aria-label="Фильтр по статусу">
+    <button type="button" data-f="all" aria-pressed="true">Все<b id="c-all">–</b></button>
+    <button type="button" data-f="off" class="f-off" aria-pressed="false">Без света<b id="c-off">–</b></button>
+    <button type="button" data-f="on" aria-pressed="false">Со светом<b id="c-on">–</b></button>
+    <button type="button" data-f="unknown" aria-pressed="false">Нет ответа<b id="c-unk">–</b></button>
+  </div>
+
+  <div class="tools">
+    <input id="q" type="search" placeholder="Номер или адрес" autocomplete="off" aria-label="Поиск магазина">
+    <button class="ghost" id="fit" type="button">Все на карте</button>
+  </div>
+
+  <p id="note" hidden></p>
+  <div id="list"></div>
+</aside>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
