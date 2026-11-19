@@ -13,6 +13,7 @@ from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from handlers.panel import refresh_shop_panel
 from handlers.supervisor import refresh_supervisor_daily_report
 
+from pathlib import Path
 from database.database import (
     get_user,
     get_daily_check_shops,
@@ -53,9 +54,25 @@ from database.database import (
     
 )
 
+
+SUPERVISORS_FILE = Path(__file__).resolve().parent.parent / "supervisors.json"
 router = Router()
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
+def get_supervisors_without_sign_checks() -> set[int]:
+    """MAX user_id супервайзеров, у которых sign_checks = false в supervisors.json."""
+    try:
+        with open(SUPERVISORS_FILE, encoding="utf-8") as f:
+            supervisors = json.load(f)
+    except Exception:
+        logging.exception("Не удалось прочитать supervisors.json")
+        return set()
+
+    return {
+        s["max_user_id"]
+        for s in supervisors
+        if not s.get("sign_checks", True)
+    }
 
 def daily_keyboard(check_id: int):
     builder = InlineKeyboardBuilder()
@@ -85,11 +102,15 @@ def sign_keyboard(check_id: int, check_type: str):
 
     return builder.as_markup()
 
-
 async def send_sign_checks(bot, check_type: str, check_date: str | None = None):
     check_date = check_date or datetime.now(MOSCOW_TZ).date().isoformat()
 
-    shops = await get_sign_check_shops()
+    excluded = get_supervisors_without_sign_checks()
+    all_shops = await get_sign_check_shops()
+    shops = [
+        shop for shop in all_shops
+        if dict(shop).get("supervisor_id") not in excluded
+    ]
 
     question = (
         "💡 ВКЛЮЧИТЕ ВЫВЕСКУ!"
@@ -98,9 +119,10 @@ async def send_sign_checks(bot, check_type: str, check_date: str | None = None):
     )
 
     logging.info(
-        "Отправляем опрос вывесок: type=%s, shops=%s",
+        "Отправляем опрос вывесок: type=%s, shops=%s (исключено: %s)",
         check_type,
-        len(shops)
+        len(shops),
+        len(all_shops) - len(shops),
     )
 
     for shop in shops:
@@ -138,21 +160,15 @@ async def send_sign_checks(bot, check_type: str, check_date: str | None = None):
                 message_id=sent.message.body.mid
             )
 
-            logging.info(
-                "Опрос вывески отправлен магазину %s",
-                shop["code"]
-            )
+            logging.info("Опрос вывески отправлен магазину %s", shop["code"])
 
         except Exception as exc:
-            await mark_sign_check_delivery_failed(
-                check_id,
-                repr(exc)
-            )
-
+            await mark_sign_check_delivery_failed(check_id, repr(exc))
             logging.exception(
                 "Ошибка отправки опроса вывески магазину %s",
                 shop["code"]
             )
+            
 async def send_daily_checks(bot, check_date: str | None = None):
     """Создаёт/доставляет опросы за дату; незавершённые отправки повторяются."""
     check_date = check_date or datetime.now(MOSCOW_TZ).date().isoformat()
@@ -233,12 +249,16 @@ async def process_daily_check_reminders(bot):
     4+ — повторные напоминания магазину каждый час.
     """
 
+    # После 20:00 напоминания не отправляем.
+    if datetime.now(MOSCOW_TZ).hour >= 20:
+        return
+
     today = datetime.now(MOSCOW_TZ).date().isoformat()
 
     # Создаём записи для всех доставленных опросов без ответа.
     await prepare_daily_check_reminders(today)
 
-    reminders = await get_due_daily_check_reminders()
+    reminders = await get_due_daily_check_reminders(today)
 
     for reminder in reminders:
         shop_id = reminder["shop_id"]
@@ -318,7 +338,6 @@ async def process_daily_check_reminders(bot):
                 reminder["code"]
             )
 
-
 async def send_daily_summary(bot, check_date: str):
     """Отправляет утреннюю сводку отдельно в группу каждого супервайзера."""
     if not await has_pending_daily_summary(check_date):
@@ -334,25 +353,39 @@ async def send_daily_summary(bot, check_date: str):
     for shop in results:
         grouped[shop["group_chat_id"]].append(shop)
 
+    all_sent = True
+
     for group_id, group_shops in grouped.items():
         messages = []
         for shop in group_shops:
-            status = shop["status"]
-            if status == "off":
-                emoji, status_text = "🔴", "8:15 открыт без ЭЭ"
-            elif status == "on":
-                emoji, status_text = "🟢", "8:15 открыт с ЭЭ"
-            else:
-                emoji, status_text = "⚪", "8:15 нет ответа"
-            messages.append(f"{emoji} {shop['code']}\n{shop['address']}\n{status_text}")
+            if shop["status"] == "off":
+                messages.append(
+                    f"🔴 {shop['code']}\n"
+                    f"{shop['address']}\n"
+                    "8:15 открыт без ЭЭ"
+                )
 
-        await bot.send_message(chat_id=group_id, text="\n\n".join(messages))
+        text = (
+            "\n\n".join(messages)
+            if messages
+            else "🟢 Все магазины открылись с ЭЭ"
+        )
 
-    await mark_daily_checks_summary_sent(check_date)
-    logging.info("Утренние сводки за %s отправлены. Магазинов: %s", check_date, len(results))
+        try:
+            await bot.send_message(chat_id=group_id, text=text)
+        except Exception:
+            all_sent = False
+            logging.exception(
+                "Не удалось отправить утреннюю сводку в группу %s",
+                group_id
+            )
 
-
-
+    if all_sent:
+        await mark_daily_checks_summary_sent(check_date)
+        logging.info(
+            "Утренние сводки за %s отправлены. Магазинов: %s",
+            check_date, len(results)
+        )
 
 def build_closing_summary(shops) -> str:
     """Формирует вечерний отчёт, исключая магазины без подтверждённого статуса."""
@@ -531,18 +564,18 @@ async def send_closing_summary(bot, summary_date):
             len(reports)
         )
 
-
-
 async def daily_check_scheduler(bot):
     """
     Расписание (Europe/Moscow):
-    08:15 — утренний опрос электричества.
-    08:30 — опрос включения вывески.
-    09:15 и далее — напоминания каждые 30 секунд проверяются планировщиком.
+    08:15–12:00 — утренний опрос электричества.
+    08:30–12:00 — опрос включения вывески.
+    Напоминания проверяются каждые 30 секунд.
     22:00 — опрос выключения вывески.
     22:10 — вечерний отчёт.
 
     Каждый вид отправки запускается один раз за календарный день.
+    Верхняя граница окна нужна, чтобы рестарт бота вечером
+    не рассылал утренние опросы.
     """
 
     logging.info("Планировщик запущен (Europe/Moscow)")
@@ -558,18 +591,15 @@ async def daily_check_scheduler(bot):
         try:
             now = datetime.now(MOSCOW_TZ)
             today = now.date().isoformat()
+            m = now.hour * 60 + now.minute
 
-            # 08:15 — утренний опрос электричества.
-            if (
-                now.hour > 8 or (now.hour == 8 and now.minute >= 15)
-            ) and completed["daily"] != today:
+            # 08:15–12:00 — утренний опрос электричества.
+            if 8 * 60 + 15 <= m < 12 * 60 and completed["daily"] != today:
                 completed["daily"] = today
                 await send_daily_checks(bot, today)
 
-            # 08:30 — включение вывески.
-            if (
-                now.hour > 8 or (now.hour == 8 and now.minute >= 30)
-            ) and completed["sign_on"] != today:
+            # 08:30–12:00 — включение вывески.
+            if 8 * 60 + 30 <= m < 12 * 60 and completed["sign_on"] != today:
                 completed["sign_on"] = today
                 await send_sign_checks(
                     bot,
@@ -580,8 +610,8 @@ async def daily_check_scheduler(bot):
             # Напоминания проверяются постоянно.
             await process_daily_check_reminders(bot)
 
-            # 22:00 — выключение вывески.
-            if now.hour >= 22 and completed["sign_off"] != today:
+            # 22:00–24:00 — выключение вывески.
+            if m >= 22 * 60 and completed["sign_off"] != today:
                 completed["sign_off"] = today
                 await send_sign_checks(
                     bot,
@@ -589,10 +619,8 @@ async def daily_check_scheduler(bot):
                     check_date=today
                 )
 
-            # 22:10 — вечерний отчёт.
-            if (
-                now.hour > 22 or (now.hour == 22 and now.minute >= 10)
-            ) and completed["summary"] != today:
+            # 22:10–24:00 — вечерний отчёт.
+            if m >= 22 * 60 + 10 and completed["summary"] != today:
                 completed["summary"] = today
                 await send_closing_summary(bot, today)
 
@@ -605,7 +633,7 @@ async def daily_check_scheduler(bot):
         except Exception:
             logging.exception("Ошибка планировщика")
             await asyncio.sleep(5)
-            
+
 @router.message_callback(
     F.callback.payload.startswith("daily_check:")
 )
@@ -645,7 +673,6 @@ async def daily_check_callback(event: MessageCallback):
         if check["shop_id"] != db_user["shop_id"]:
             return
 
-
         saved = await answer_daily_check(
             check_id=check_id,
             shop_id=db_user["shop_id"],
@@ -654,14 +681,15 @@ async def daily_check_callback(event: MessageCallback):
 
         if not saved:
             return
+
         await stop_daily_check_reminders(
             db_user["shop_id"],
             check["check_date"]
         )
+
         morning_time = datetime.fromisoformat(
             f"{check['check_date']}T08:15:00+03:00"
         ).isoformat(timespec="seconds")
-
 
         try:
             if status == "off":
@@ -671,31 +699,26 @@ async def daily_check_callback(event: MessageCallback):
                     morning_time=morning_time
                 )
 
-                emoji = "🔴"
-                message = "Открылся без ЭЭ в 8:15"
+                # В группу супервайзера пишем только про отсутствие света.
+                group = await get_shop_group(db_user["shop_id"])
+
+                if group is not None:
+                    await event.bot.send_message(
+                        chat_id=group["group_chat_id"],
+                        text=(
+                            f"🔴 №{db_user['code']}\n"
+                            f"{db_user['address']}\n"
+                            "Открылся без ЭЭ в 8:15"
+                        )
+                    )
 
             else:
                 # Закрываем активное отключение, если оно есть.
+                # В группу ничего не отправляем.
                 result = await switch_power(
                     shop_id=db_user["shop_id"],
                     action="power_on",
                     ended_at_override=morning_time
-                )
-
-                emoji = "🟢"
-                message = "Открылся с ЭЭ в 8:15"
-
-            # Отправляем сообщение в группу супервайзера.
-            group = await get_shop_group(db_user["shop_id"])
-
-            if group is not None:
-                await event.bot.send_message(
-                    chat_id=group["group_chat_id"],
-                    text=(
-                        f"{emoji}\n\n"
-                        f"№{db_user['code']} {db_user['address']}\n\n"
-                        f"{message}"
-                    )
                 )
 
             # Обновляем панель магазина.
@@ -724,6 +747,7 @@ async def daily_check_callback(event: MessageCallback):
                 supervisor_id=db_user["supervisor_id"],
                 check_date=check["check_date"]
             )
+
         # Удаляем сообщение с кнопками после сохранения ответа
         try:
             await event.bot.delete_message(
@@ -738,6 +762,8 @@ async def daily_check_callback(event: MessageCallback):
         logging.exception(
             "Ошибка обработки утреннего опроса"
         )
+
+
 @router.message_callback(
     F.callback.payload.startswith("sign_check:")
 )

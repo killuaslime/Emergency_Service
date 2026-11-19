@@ -653,17 +653,12 @@ async def get_supervisor_history(
 
         return await cursor.fetchall()
 
-
-
-
-
-
 async def get_daily_check_shops():
     async with aiosqlite.connect(DB_PATH, timeout=30) as db:
         db.row_factory = aiosqlite.Row
 
         cursor = await db.execute("""
-            SELECT s.id, s.code, s.address, s.panel_chat_id
+            SELECT s.id, s.code, s.address, s.panel_chat_id, s.supervisor_id
             FROM shops s
             WHERE s.panel_chat_id IS NOT NULL
               AND EXISTS (
@@ -676,7 +671,7 @@ async def get_daily_check_shops():
         """)
 
         return await cursor.fetchall()
-
+    
 async def create_daily_check(shop_id: int, check_date: str):
     """Создаёт опрос или возвращает ID ещё не доставленного опроса.
 
@@ -1390,9 +1385,8 @@ async def prepare_daily_check_reminders(check_date: str):
 
         await db.commit()
 
-
-async def get_due_daily_check_reminders():
-    """Получает магазины, которым пора отправить напоминание."""
+async def get_due_daily_check_reminders(check_date: str):
+    """Получает магазины, которым пора отправить напоминание за указанную дату."""
 
     now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
 
@@ -1420,10 +1414,11 @@ async def get_due_daily_check_reminders():
                 ON sv.max_user_id = s.supervisor_id
                AND sv.is_active = 1
             WHERE dc.status IS NULL
+              AND r.check_date = ?
               AND r.next_reminder_at IS NOT NULL
               AND r.next_reminder_at <= ?
             ORDER BY r.next_reminder_at
-        """, (now,))
+        """, (check_date, now))
 
         return await cursor.fetchall()
 
